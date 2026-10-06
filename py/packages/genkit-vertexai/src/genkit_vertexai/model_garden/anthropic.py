@@ -21,13 +21,18 @@ from collections.abc import Awaitable, Callable
 from typing import cast
 
 from anthropic import AsyncAnthropic, AsyncAnthropicVertex
-from genkit_anthropic.config import AnthropicConfig
-from genkit_anthropic.models import AnthropicModel
+from genkit_anthropic import AnthropicConfig
+
+# Private import across packages, on purpose. genkit-anthropic and
+# genkit-vertexai release in lockstep, so Model Garden reuses the Claude
+# model class instead of copying it.
+from genkit_anthropic._models import AnthropicModel
 from pydantic import ConfigDict
 from pydantic.config import JsonDict
 
-from genkit import ModelConfig, ModelInfo, ModelRequest, ModelResponse, Supports
-from genkit.plugin_api import ActionRunContext, loop_local_client
+from genkit import ActionRunContext, ModelResponse
+from genkit.model import ModelConfig, ModelInfo, ModelRequest, Supports
+from genkit.plugin_api import loop_local_client
 
 
 def _vertex_anthropic_config_schema_extra(schema: JsonDict) -> None:

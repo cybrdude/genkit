@@ -16,11 +16,18 @@
 
 """Error classes and utilities for the Genkit framework."""
 
+import math
+import time
+from collections.abc import Mapping
+from email.utils import parsedate_to_datetime
 from enum import IntEnum
-from typing import Any, ClassVar, Literal, TypedDict
+from typing import Any, ClassVar, Literal, TypedDict, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
+
+from genkit._core._compat import StrEnum
+from genkit._core._typing import GenkitRuntimeError as GenkitRuntimeErrorData
 
 
 class StatusCodes(IntEnum):
@@ -66,6 +73,61 @@ StatusName = Literal[
     'DATA_LOSS',
 ]
 
+
+class RuntimeErrorReason(StrEnum):
+    """Extra why on a classified generate failure or a helper raise.
+
+    The message stays human. The helper that fails sets this so it
+    bubbles on the exception the caller actually catches.
+    """
+
+    INVALID_SCHEMA = 'INVALID_SCHEMA'
+    INVALID_INPUT = 'INVALID_INPUT'
+    INVALID_OUTPUT = 'INVALID_OUTPUT'
+    ACTION_NOT_FOUND = 'ACTION_NOT_FOUND'
+    MODEL_NOT_FOUND = 'MODEL_NOT_FOUND'
+    TOOL_NOT_FOUND = 'TOOL_NOT_FOUND'
+    MAX_TURNS_EXCEEDED = 'MAX_TURNS_EXCEEDED'
+    TOOL_FAILED = 'TOOL_FAILED'
+    UNSUPPORTED_BY_MODEL = 'UNSUPPORTED_BY_MODEL'
+    INVALID_PART = 'INVALID_PART'
+    UNRESOLVED_TOOL_REQUEST = 'UNRESOLVED_TOOL_REQUEST'
+    INVALID_RESUME = 'INVALID_RESUME'
+    SNAPSHOT_NOT_FOUND = 'SNAPSHOT_NOT_FOUND'
+    SNAPSHOT_NOT_RESUMABLE = 'SNAPSHOT_NOT_RESUMABLE'
+    SESSION_STORE_NOT_CONFIGURED = 'SESSION_STORE_NOT_CONFIGURED'
+    SESSION_ID_REQUIRED = 'SESSION_ID_REQUIRED'
+    INVALID_SESSION_ID = 'INVALID_SESSION_ID'
+    INVALID_SNAPSHOT_ID = 'INVALID_SNAPSHOT_ID'
+    CONNECTION_CLOSED = 'CONNECTION_CLOSED'
+
+
+def runtime_error_reason(details: object) -> RuntimeErrorReason | None:
+    """Read a known stable reason from runtime error details."""
+    if not isinstance(details, Mapping):
+        return None
+    value = cast(Mapping[str, object], details).get('reason')
+    if not isinstance(value, str):
+        return None
+    try:
+        return RuntimeErrorReason(value)  # pyrefly: ignore[bad-return]
+    except ValueError:
+        return None
+
+
+class GenkitRuntimeError(GenkitRuntimeErrorData):
+    """Classified generate failure sitting on ``response.error``.
+
+    The wire is still status, message, and details. ``reason`` is the
+    framework why when we put one in details, so callers can branch
+    without parsing the message.
+    """
+
+    @property
+    def reason(self) -> RuntimeErrorReason | None:
+        return runtime_error_reason(self.details)
+
+
 # Mapping of status names to HTTP status codes
 _STATUS_CODE_MAP: dict[StatusName, int] = {
     'OK': 200,
@@ -87,6 +149,17 @@ _STATUS_CODE_MAP: dict[StatusName, int] = {
     'DATA_LOSS': 500,
 }
 
+# Reverse of _STATUS_CODE_MAP. A few HTTP codes are shared (400, 409, 500);
+# the overlays pick the status retry should treat as the default for that
+# code — a bad request, a conflict abort, an internal failure.
+_HTTP_CODE_TO_STATUS: dict[int, StatusName] = {code: name for name, code in _STATUS_CODE_MAP.items()}
+_HTTP_CODE_TO_STATUS.update({
+    400: 'INVALID_ARGUMENT',
+    408: 'DEADLINE_EXCEEDED',
+    409: 'ABORTED',
+    500: 'INTERNAL',
+})
+
 
 def http_status_code(status: StatusName) -> int:
     """Gets the HTTP status code for a given status name.
@@ -98,6 +171,96 @@ def http_status_code(status: StatusName) -> int:
         The corresponding HTTP status code.
     """
     return _STATUS_CODE_MAP[status]
+
+
+def http_code(code: object) -> int | None:
+    """A real HTTP status (100-599), or None if this was not a status at all.
+
+    ``-1``, ``0``, ``None``, and ``'nope'`` are missing values, not unmapped
+    4xx. Callers that wrap should leave those unclassified so retry can still
+    try again.
+    """
+    if isinstance(code, bool):
+        return None
+    resolved: int
+    if isinstance(code, int):
+        resolved = code
+    else:
+        try:
+            resolved = int(code)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+    if 100 <= resolved <= 599:
+        return resolved
+    return None
+
+
+def from_http_code(code: int) -> StatusName:
+    """Canonical status name for an HTTP status code.
+
+    Any 5xx with no explicit entry falls through to ``INTERNAL``; unmapped
+    4xx codes return ``UNKNOWN``. A 408 is ``DEADLINE_EXCEEDED`` so retry
+    can wait out a transient timeout. Plugins wrap provider HTTP errors
+    with this so retry can skip a 400 without also skipping a 503.
+    """
+    mapped = _HTTP_CODE_TO_STATUS.get(code)
+    if mapped is not None:
+        return mapped
+    if code >= 500:
+        return 'INTERNAL'
+    return 'UNKNOWN'
+
+
+def parse_retry_after_ms(value: str) -> float | None:
+    """Parse an HTTP Retry-After value into milliseconds.
+
+    Accepts delay-seconds (``60``, ``1.5``) and HTTP-date values. Retry uses
+    this as a floor so a provider that said wait 60s is not hit again in 1s.
+    """
+    value = value.strip()
+    if not value:
+        return None
+
+    try:
+        seconds = float(value)
+    except ValueError:
+        pass
+    else:
+        # Check the scaled value: a large finite input can overflow to inf.
+        retry_after_ms = seconds * 1000
+        if seconds >= 0 and math.isfinite(retry_after_ms):
+            return retry_after_ms
+
+    try:
+        retry_at_ms = parsedate_to_datetime(value).timestamp() * 1000
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+    return max(0.0, retry_at_ms - time.time() * 1000)
+
+
+def retry_after_ms_from_error(error: Exception) -> float | None:
+    """Read Retry-After off a provider SDK error, if it carried one."""
+    headers = None
+    response = getattr(error, 'response', None)
+    if response is not None:
+        headers = getattr(response, 'headers', None)
+    if headers is None:
+        headers = getattr(error, 'headers', None)
+    if headers is None:
+        return None
+    try:
+        raw = headers.get('retry-after')
+    except (AttributeError, TypeError):
+        return None
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0] if raw else None
+    if not isinstance(raw, str):
+        raw = str(raw) if raw is not None else None
+    if not raw:
+        return None
+    return parse_retry_after_ms(raw)
 
 
 class Status(BaseModel):
@@ -164,13 +327,16 @@ class ErrorResponseMetadata(TypedDict, total=False):
     headers: dict[str, str]
 
 
-class GenkitInterrupt(Exception):  # noqa: N818 - marker base class; intentionally not suffixed *Error
-    """Marker base class for tool interrupts.
+class Interrupt(Exception):  # noqa: N818 - public Genkit name; not renamed *Error for style
+    """Pause a tool or generate so the caller can approve, reply, or restart.
 
-    Raised by tools to pause execution and hand control back to the caller.
-    The tracing wrapper uses this to distinguish control-flow interrupts from
-    real errors so they don't appear as red failures in the Dev UI.
+    Raise ``Interrupt(metadata)`` from a tool or from tool middleware.
+    Tracing treats this as control flow, not a failed span.
     """
+
+    def __init__(self, metadata: dict[str, Any] | None = None) -> None:
+        super().__init__()
+        self.metadata: dict[str, Any] = {} if metadata is None else metadata
 
 
 class GenkitError(Exception):
@@ -183,6 +349,7 @@ class GenkitError(Exception):
         status: StatusName | None = None,
         cause: Exception | None = None,
         details: Any = None,  # noqa: ANN401
+        reason: RuntimeErrorReason | None = None,
         trace_id: str | None = None,
         source: str | None = None,
         response_metadata: ErrorResponseMetadata | None = None,
@@ -194,6 +361,7 @@ class GenkitError(Exception):
             status: The status name for this error.
             cause: The underlying exception that caused this error.
             details: Optional detail information.
+            reason: Extra why when we classified the failure.
             trace_id: A unique identifier for tracing the action execution.
             source: Optional source of the error.
             response_metadata: Optional HTTP response metadata for in-process use.
@@ -220,6 +388,9 @@ class GenkitError(Exception):
 
         if not details:
             details = {}
+        if reason is not None:
+            details = dict(details)
+            details['reason'] = reason.value
         if 'stack' not in details:
             details['stack'] = get_error_stack(cause if cause else self)
         if 'trace_id' not in details and trace_id:
@@ -230,6 +401,10 @@ class GenkitError(Exception):
         self.trace_id: str | None = trace_id
         self.cause: Exception | None = cause
         self.response_metadata: ErrorResponseMetadata | None = response_metadata
+
+    @property
+    def reason(self) -> RuntimeErrorReason | None:
+        return runtime_error_reason(self.details)
 
     def to_callable_serializable(self) -> HttpErrorWireFormat:
         """Returns a JSON-serializable representation of this object.
@@ -242,7 +417,7 @@ class GenkitError(Exception):
         return HttpErrorWireFormat(
             details=self.details,
             status=StatusCodes[self.status].name,
-            message=repr(self.cause) if self.cause else self.original_message,
+            message=self.original_message,
         )
 
     def to_serializable(self) -> ReflectionError:
@@ -256,6 +431,32 @@ class GenkitError(Exception):
             code=StatusCodes[self.status].value,
             message=f'{self.original_message}: {repr(self.cause)}' if self.cause else self.original_message,
         )
+
+
+def wrap_http_error(error: Exception, *, status_code: object, message: str | None = None) -> GenkitError:
+    """Classify a provider HTTP error so retry can skip a 400 without retrying a 503.
+
+    A missing or non-HTTP ``status_code`` is left unclassified — raise the
+    original error so retry still sees a raw failure. Also reads Retry-After
+    when the SDK left it on the error, so retry waits what the provider asked
+    instead of coming back in a second.
+    """
+    resolved = http_code(status_code)
+    # A 2xx/3xx on an exception is not a failure status. Leave it
+    # unclassified so retry still sees the raw error, instead of a
+    # GenkitError that claims OK.
+    if resolved is None or resolved < 400:
+        raise error
+    retry_after_ms = retry_after_ms_from_error(error)
+    response_metadata: ErrorResponseMetadata | None = None
+    if retry_after_ms is not None:
+        response_metadata = {'retry_after_ms': retry_after_ms}
+    return GenkitError(
+        status=from_http_code(resolved),
+        message=message if message is not None else str(error),
+        cause=error,
+        response_metadata=response_metadata,
+    )
 
 
 class PublicError(GenkitError):

@@ -23,10 +23,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from genkit import GenkitError
-from genkit._core._action import Action, ActionKind
-from genkit._core._model import ModelResponse
+from genkit import GenkitError, ModelResponse
 from genkit.middleware import BaseMiddleware, GenerateMiddlewareContext, ModelHookParams
+from genkit.plugin_api import Action, ActionKind
 
 _DEFAULT_FALLBACK_STATUSES: list[str] = [
     'UNAVAILABLE',
@@ -55,7 +54,7 @@ class Fallback(BaseMiddleware[FallbackConfig]):
         model_name: str,
     ) -> Action[Any, Any, Any]:
         """Look up a fallback model on the per-call registry."""
-        action = await ctx.registry.resolve_action(ActionKind.MODEL, model_name)
+        action = await ctx.ai.registry.resolve_action(ActionKind.MODEL, model_name)
         if action is None:
             raise GenkitError(
                 status='NOT_FOUND',
@@ -81,12 +80,15 @@ class Fallback(BaseMiddleware[FallbackConfig]):
         assert last_error is not None  # noqa: S101
         on_chunk = ctx.on_chunk
         for model_name in self.config.models:
+            if ctx.abort_signal.is_set():
+                raise last_error
             fallback_action = await self._resolve_fallback_model(ctx, model_name)
             try:
                 result = await fallback_action.run(
                     input=params.request,
                     context=ctx.custom_context,
                     on_chunk=on_chunk,
+                    abort_signal=ctx.abort_signal,
                 )
                 return result.response  # type: ignore[return-value]
             except Exception as e2:

@@ -25,13 +25,9 @@ from typing import Any, TypeAlias, TypeVar
 from flask import Response, request
 from pydantic import BaseModel
 
-from genkit import Genkit, GenkitError
+from genkit import ContextProvider, Genkit, GenkitError, RequestData
 from genkit._core._action import Action
-from genkit.plugin_api import (
-    ContextProvider,
-    RequestData,
-    get_callable_json,
-)
+from genkit.plugin_api import get_callable_json
 
 # Compact JSON (no spaces) for smaller wire payload.
 _JSON_SEPARATORS = (',', ':')
@@ -96,6 +92,7 @@ def genkit_flask_handler(
     """A decorator for serving Genkit flows via a flask sever.
 
     ```python
+    from genkit import ActionRunContext
     from genkit_flask import genkit_flask_handler
 
     app = Flask(__name__)
@@ -104,11 +101,13 @@ def genkit_flask_handler(
     @app.post('/chat')
     @genkit_flask_handler(ai)
     @ai.flow()
-    async def say_hi(name: str, ctx):
-        return await ai.generate(
-            on_chunk=ctx.send_chunk,
-            prompt=f'tell a medium sized joke about {name}',
-        )
+    async def say_hi(name: str, ctx: ActionRunContext) -> str:
+        stream = ai.generate_stream(prompt=f'tell a joke about {name}')
+        async for chunk in stream.stream:
+            if chunk.text:
+                ctx.send_chunk(chunk.text)
+        res = await stream.response
+        return res.text
     ```
 
     """
@@ -133,12 +132,15 @@ def genkit_flask_handler(
                 if isinstance(context, dict):
                     action_context = context
 
-            stream = request_data.headers.get('accept') == 'text/event-stream' or request.args.get('stream') == 'true'
+            # Substring match so Accept: text/event-stream, */* (and similar) still streams.
+            accept = request_data.headers.get('accept', '')
+            stream = 'text/event-stream' in accept or request.args.get('stream') == 'true'
+            init = input_data.get('init')
             if stream:
 
                 async def async_gen() -> AsyncIterator[str]:
                     try:
-                        stream_response = flow.stream(input_data.get('data'), context=action_context)
+                        stream_response = flow.stream(input_data.get('data'), context=action_context, init=init)
                         async for chunk in stream_response.stream:
                             yield f'data: {json.dumps({"message": _to_dict(chunk)}, separators=_JSON_SEPARATORS)}\n\n'
 
@@ -148,13 +150,13 @@ def genkit_flask_handler(
                         ex = e
                         if isinstance(ex, GenkitError):
                             ex = ex.cause
-                        yield f'error: {json.dumps({"error": get_callable_json(ex)}, separators=_JSON_SEPARATORS)}'
+                        yield f'data: {json.dumps({"error": get_callable_json(ex)}, separators=_JSON_SEPARATORS)}\n\n'
 
                 iter = _iter_over_async(async_gen(), loop)
                 return iter
             else:
                 try:
-                    response = await flow.run(input_data.get('data'), context=action_context)
+                    response = await flow.run(input_data.get('data'), context=action_context, init=init)
                     return {'result': _to_dict(response.response)}
                 except Exception as e:
                     ex = e

@@ -2,12 +2,20 @@
 
 This Genkit plugin provides a unified interface for Google AI (Gemini) and Vertex AI models, embedding, and other services.
 
+> **Building with a coding agent? Install the Genkit Python skill first.**
+>
+> ```bash
+> npx skills add genkit-ai/skills --skill developing-genkit-python
+> ```
+>
+> It teaches your agent the current Genkit Python APIs and common gotchas.
+> Source, manual install and skills for other languages:
+> [genkit-ai/skills](https://github.com/genkit-ai/skills).
+
 ## Setup environment
 
 ```bash
-uv venv
-source .venv/bin/activate
-pip install genkit-plugins-google-genai
+uv add genkit genkit-google-genai
 ```
 
 ## Configuration
@@ -28,59 +36,89 @@ To use Vertex AI models, ensure you have a Google Cloud project and Application 
 gcloud auth application-default login
 ```
 
+## Quickstart
+
+```python
+from genkit import Genkit
+from genkit_google_genai import GoogleAI
+
+ai = Genkit(plugins=[GoogleAI()], model=GoogleAI.gemini_model('gemini-flash-latest'))
+
+
+@ai.flow()
+async def greet(name: str) -> str:
+    res = await ai.generate(prompt=f'Say hello to {name}.')
+    return res.text
+```
+
 ## Features
 
 ### Dynamic Models
 
-The plugin automatically discovers available models from the API upon initialization. You can use any model name supported by the API (e.g., `googleai/gemini-2.0-flash-exp`, `vertexai/gemini-1.5-pro`).
+The plugin automatically discovers available models from the API upon initialization. You can use any model name supported by the API (e.g., `GoogleAI.gemini_model('gemini-flash-latest')`, `VertexAI.gemini_model('gemini-3.1-pro-preview')`).
 
 ### Dynamic Configuration
 
-New or experimental parameters can be passed flexibly using `model_validate` to bypass strict schema checks:
+Unrecognized provider parameters on the family config are forwarded to the API:
 
 ```python
-from genkit_google_genai import GeminiConfigSchema
+from genkit_google_genai import GeminiConfig
 
-config = GeminiConfigSchema.model_validate({
+config = GeminiConfig.model_validate({
     'temperature': 1.0,
     'response_modalities': ['TEXT', 'IMAGE'],
 })
 ```
 
-### Vertex AI Rerankers
+### Video generation (Veo)
 
-The VertexAI plugin provides semantic rerankers for improving RAG quality by re-scoring documents based on relevance:
+Video is a job, not a round-trip. `generate_operation` hands back a ticket;
+`check_operation` is how you find out when the video is ready. When the job
+finishes, `operation.output` has a playable `media.url` — Studio sends a
+download URL, Vertex often sends the mp4 inline.
+
+**With `GoogleAI`:**
+
+```python
+from genkit import Genkit
+from genkit_google_genai import GoogleAI
+
+ai = Genkit(plugins=[GoogleAI()])
+
+operation = await ai.generate_operation(
+    model=GoogleAI.veo_model('veo-3.1-fast-generate-preview'),
+    prompt='A paper airplane gliding through a bright classroom',
+)
+while not operation.done:
+    operation = await ai.check_operation(operation)
+print(operation.output)
+```
+
+**With `VertexAI`:**
 
 ```python
 from genkit import Genkit
 from genkit_google_genai import VertexAI
 
-ai = Genkit(plugins=[VertexAI(project='my-project')])
+ai = Genkit(plugins=[VertexAI()])
 
-# Rerank documents after retrieval
-ranked_docs = await ai.rerank(
-    reranker='vertexai/semantic-ranker-default@latest',
-    query='What is machine learning?',
-    documents=retrieved_docs,
-    options={'top_n': 5},
+operation = await ai.generate_operation(
+    model=VertexAI.veo_model('veo-3.1-generate-001'),
+    prompt='A paper airplane gliding through a bright classroom',
 )
+while not operation.done:
+    operation = await ai.check_operation(operation)
+print(operation.output)
 ```
 
-**Supported Models:**
-
-| Model | Description |
-|-------|-------------|
-| `semantic-ranker-default@latest` | Latest default semantic ranker |
-| `semantic-ranker-default-004` | Semantic ranker version 004 |
-| `semantic-ranker-fast-004` | Fast variant (lower latency) |
+Runnable version: [google-genai-media](https://github.com/genkit-ai/genkit/tree/main/py/samples/google-genai-media).
 
 ### Vertex AI Evaluators
 
 Built-in evaluators for assessing model output quality. Evaluators are automatically registered when using the VertexAI plugin and are accessed via `ai.evaluate()`:
 
 ```python
-from genkit import Genkit
-from genkit._core.typing import BaseDataPoint
+from genkit import BaseDataPoint, Genkit
 from genkit_google_genai import VertexAI
 
 ai = Genkit(plugins=[VertexAI(project='my-project')])
@@ -103,23 +141,4 @@ for result in results.root:
     print(f'Score: {result.evaluation.score}')
 ```
 
-
-**Supported Metrics:**
-
-| Metric | Description |
-|--------|-------------|
-| `BLEU` | Translation quality (compare to reference) |
-| `ROUGE` | Summarization quality |
-| `FLUENCY` | Language mastery and readability |
-| `SAFETY` | Harmful/inappropriate content detection |
-| `GROUNDEDNESS` | Hallucination detection |
-| `SUMMARIZATION_QUALITY` | Overall summarization ability |
-
-## Examples
-
-For comprehensive usage examples, see:
-
-- [`py/samples/google-genai-media/README.md`](../../samples/google-genai-media/README.md) - Speech, image, and video generation
-- [`py/samples/gemini-code-execution/README.md`](../../samples/gemini-code-execution/README.md) - Gemini code execution
-- [`py/samples/gemini-context-caching/README.md`](../../samples/gemini-context-caching/README.md) - Context caching for large prompts
-- [`py/samples/vertexai-imagen/README.md`](../../samples/vertexai-imagen/README.md) - Vertex AI Imagen generation
+Runnable snippets are in [`py/samples`](../../samples).

@@ -19,9 +19,11 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 
 	"github.com/firebase/genkit/go/core"
 	"github.com/firebase/genkit/go/core/api"
+	"github.com/firebase/genkit/go/core/status"
 )
 
 // Hooks is the per-call bundle of hook functions produced by a [Middleware]'s
@@ -47,9 +49,17 @@ type Hooks struct {
 
 // GenerateParams holds params for the WrapGenerate hook.
 type GenerateParams struct {
-	// Options is the original options passed to [Generate].
+	// Options is a per-turn copy of the options [Generate] was called with,
+	// for the settings Request does not carry: model name, turn limit, resume
+	// directives. Its Messages are the call's original ones; read
+	// Request.Messages for the conversation as of this turn. Treat it as
+	// read-only: the loop keeps its own copy, so writes here reach nothing.
+	// The copy is shallow, so values it points at are still shared.
 	Options *GenerateActionOptions
-	// Request is the current model request for this iteration, with accumulated messages.
+	// Request is the model request for this turn, with the messages
+	// accumulated so far. Replace it, or edit it in place, to change what the
+	// model receives. Each turn gets its own value, so an edit stays with this
+	// turn unless it lands on a message shared with the next.
 	Request *ModelRequest
 	// Iteration is the current tool-loop iteration (0-indexed).
 	Iteration int
@@ -94,8 +104,17 @@ type ToolNext = func(ctx context.Context, params *ToolParams) (*MultipartToolRes
 // per-call [Hooks] bundle (via [New]).
 //
 // Plugin-level state belongs on unexported fields of the config type. A
-// plugin's [MiddlewarePlugin.Middlewares] sets those fields on a prototype
-// that is preserved across JSON dispatch by value-copy inside the descriptor.
+// plugin's [MiddlewarePlugin.Middlewares] sets those fields on a prototype,
+// which every JSON-dispatched call copies before unmarshalling its own
+// config over the exported fields. Unexported state therefore carries into
+// each call, and state that must be shared across calls (a client, a cache)
+// belongs behind a pointer, which survives the copy pointing at the same
+// object.
+//
+// Exported fields are per-call user config, never plugin defaults: a call
+// that omits one gets the zero value, so defaults belong in New. Leave them
+// zero on the prototype, since a copy would otherwise share their slices and
+// maps with it.
 type Middleware interface {
 	// Name returns the registered middleware's unique identifier. Must be a
 	// stable constant, since it is read from a zero value of the config type
@@ -110,8 +129,8 @@ type Middleware interface {
 
 // middlewareFactoryFunc is the closure stored on [MiddlewareDesc] that
 // materializes a [Hooks] bundle from JSON config. It is produced by
-// [NewMiddleware] and captures the prototype so value-copy preserves any
-// unexported plugin-level state across JSON-dispatched calls.
+// [NewMiddleware] and copies the prototype per call so unexported
+// plugin-level state carries into each JSON-dispatched invocation.
 type middlewareFactoryFunc = func(ctx context.Context, configJSON []byte) (*Hooks, error)
 
 // middlewareRegistryPrefix is the registry-key prefix under which middleware
@@ -130,10 +149,9 @@ func (d *MiddlewareDesc) Register(r api.Registry) {
 
 // NewMiddleware constructs a descriptor without registering it. Useful for
 // [MiddlewarePlugin.Middlewares] implementations that defer registration
-// to [genkit.Init]. The prototype argument supplies both the registered name
-// (via its [Middleware.Name] method) and any plugin-level state that should
-// flow into JSON-dispatched invocations via unexported fields preserved by
-// value-copy.
+// to [genkit.Init]. The prototype argument supplies the registered name (via
+// its [Middleware.Name] method), the config schema, and any plugin-level
+// state on unexported fields; see [Middleware] for what belongs where.
 func NewMiddleware[M Middleware](description string, prototype M) *MiddlewareDesc {
 	name := prototype.Name()
 	return &MiddlewareDesc{
@@ -141,10 +159,10 @@ func NewMiddleware[M Middleware](description string, prototype M) *MiddlewareDes
 		Description:  description,
 		ConfigSchema: core.InferSchemaMap(prototype),
 		buildFromJSON: func(ctx context.Context, configJSON []byte) (*Hooks, error) {
-			cfg := prototype // value copy preserves unexported fields, shares pointers
+			cfg := isolate(prototype)
 			if len(configJSON) > 0 {
 				if err := json.Unmarshal(configJSON, &cfg); err != nil {
-					return nil, core.NewError(core.INVALID_ARGUMENT, "middleware %q: %w", name, err)
+					return nil, status.Errorf(status.ErrInvalidArgument, "middleware %q: %w", name, err)
 				}
 			}
 			return cfg.New(ctx)
@@ -152,11 +170,22 @@ func NewMiddleware[M Middleware](description string, prototype M) *MiddlewareDes
 	}
 }
 
-// DefineMiddleware creates and registers a middleware descriptor in one step.
-func DefineMiddleware[M Middleware](r api.Registry, description string, prototype M) *MiddlewareDesc {
-	d := NewMiddleware(description, prototype)
-	d.Register(r)
-	return d
+// isolate returns a copy of prototype that a call's config can be
+// unmarshalled into without writing through to the registered prototype.
+// Assignment already copies a value prototype; a pointer one would share its
+// pointee, so the struct behind it is copied into a fresh allocation.
+func isolate[M Middleware](prototype M) M {
+	v := reflect.ValueOf(prototype)
+	if v.Kind() != reflect.Pointer {
+		return prototype
+	}
+	fresh := reflect.New(v.Type().Elem())
+	if !v.IsNil() {
+		fresh.Elem().Set(v.Elem())
+	}
+	// A nil prototype has no state to copy, but New still needs a receiver:
+	// a call that sends no config unmarshals nothing and would get the nil.
+	return fresh.Interface().(M)
 }
 
 // MiddlewareFunc adapts a per-call factory closure to the [Middleware]
@@ -175,6 +204,7 @@ type MiddlewareFunc func(ctx context.Context) (*Hooks, error)
 // in [resolveRefs] and never goes through a name-keyed registry lookup.
 func (MiddlewareFunc) Name() string { return "inline" }
 
+// New implements [Middleware] by calling f.
 func (f MiddlewareFunc) New(ctx context.Context) (*Hooks, error) { return f(ctx) }
 
 // middlewareRefArg is a lazy [Middleware] that carries only a registered
@@ -195,7 +225,7 @@ func (r middlewareRefArg) Name() string { return r.name }
 // for a name-only [MiddlewareRef] before [resolveRefs] sees it; the error
 // here surfaces a routing bug instead of returning nil hooks.
 func (middlewareRefArg) New(context.Context) (*Hooks, error) {
-	return nil, core.NewError(core.INTERNAL, "ai: middlewareRefArg must be resolved via the registry")
+	return nil, status.Errorf(status.ErrInternal, "ai: middlewareRefArg must be resolved via the registry")
 }
 
 // LookupMiddleware returns the registered middleware descriptor with the
@@ -233,7 +263,7 @@ func configsToRefs(configs []Middleware) ([]*MiddlewareRef, error) {
 	refs := make([]*MiddlewareRef, 0, len(configs))
 	for _, c := range configs {
 		if c == nil {
-			return nil, core.NewError(core.INVALID_ARGUMENT, "ai: nil middleware")
+			return nil, status.Errorf(status.ErrInvalidArgument, "ai: nil middleware")
 		}
 		if lazy, ok := c.(middlewareRefArg); ok {
 			refs = append(refs, &MiddlewareRef{Name: lazy.name, Config: lazy.config})
@@ -244,48 +274,85 @@ func configsToRefs(configs []Middleware) ([]*MiddlewareRef, error) {
 	return refs, nil
 }
 
-// resolveRefs resolves [MiddlewareRef] entries to [Hooks] bundles. If
+// namedHooks pairs a middleware's registered name with the per-call [Hooks]
+// bundle it produced. Middleware gets no spans of its own (its hooks wrap
+// spans other actions create), so the name travels with the hooks to let the
+// chain builders attribute log records to the middleware that ran.
+type namedHooks struct {
+	name  string
+	hooks *Hooks
+}
+
+// wrapBuildError prefixes a middleware build failure with the middleware's
+// name. An error the middleware's New already classified keeps its status
+// (status.Of reports the outermost classified error, so reclassifying here
+// would rebrand e.g. an UNAVAILABLE from a network-backed New, a disk error
+// from a file-reading New, or a cancelled context as a caller mistake). Only
+// unclassified errors default to INVALID_ARGUMENT, since a bare error from a
+// New is overwhelmingly config validation.
+//
+// The classified case re-states the message on a status error of its own rather
+// than wrapping with fmt.Errorf. Serialization resolves to the outermost
+// *status.Error, so a plain wrap would hand the client the inner message alone,
+// with nothing naming the middleware that failed. Building the envelope here
+// also keeps it non-public, so a New that returns a PublicErrorf does not have
+// its text forwarded to clients by a path that never chose to publish it. The
+// cause stays reachable, so errors.Is still matches the middleware's sentinel.
+func wrapBuildError(name string, err error) error {
+	s, ok := status.Classified(err)
+	if !ok {
+		// Unclassified build failures are overwhelmingly config validation.
+		s = status.InvalidArgument
+	}
+	// status.Base is the sanctioned constructor for a status known only at
+	// runtime. Building the error by hand would leave it without a stack and
+	// without a sentinel to match on, and would drop any Details the cause
+	// carries, since Convert resolves to the outermost classified error.
+	return status.Errorf(status.Base(s), "ai: failed to build middleware %q: %w", name, err)
+}
+
+// resolveRefs resolves [MiddlewareRef] entries to named [Hooks] bundles. If
 // ref.Config is a [Middleware] value, its New method is invoked directly
 // (local fast path). Otherwise the descriptor is looked up in the registry
 // and its build closure is invoked with the marshaled config (JSON dispatch,
 // used for cross-runtime / Dev UI calls).
-func resolveRefs(ctx context.Context, r api.Registry, refs []*MiddlewareRef) ([]*Hooks, error) {
+func resolveRefs(ctx context.Context, r api.Registry, refs []*MiddlewareRef) ([]namedHooks, error) {
 	if len(refs) == 0 {
 		return nil, nil
 	}
-	bundles := make([]*Hooks, 0, len(refs))
+	bundles := make([]namedHooks, 0, len(refs))
 	for _, ref := range refs {
 		if mw, ok := ref.Config.(Middleware); ok {
 			h, err := mw.New(ctx)
 			if err != nil {
-				return nil, core.NewError(core.INVALID_ARGUMENT, "ai: failed to build middleware %q: %v", ref.Name, err)
+				return nil, wrapBuildError(ref.Name, err)
 			}
 			if h == nil {
-				return nil, core.NewError(core.INTERNAL, "ai: middleware %q returned nil hooks", ref.Name)
+				return nil, status.Errorf(status.ErrInternal, "ai: middleware %q returned nil hooks", ref.Name)
 			}
-			bundles = append(bundles, h)
+			bundles = append(bundles, namedHooks{name: ref.Name, hooks: h})
 			continue
 		}
 		d := LookupMiddleware(r, ref.Name)
 		if d == nil {
-			return nil, core.NewError(core.NOT_FOUND, "ai: middleware %q not registered (is the providing plugin installed?)", ref.Name)
+			return nil, status.Errorf(status.ErrNotFound, "ai: middleware %q not registered (is the providing plugin installed?)", ref.Name)
 		}
 		var configJSON []byte
 		if ref.Config != nil {
 			b, err := json.Marshal(ref.Config)
 			if err != nil {
-				return nil, core.NewError(core.INTERNAL, "ai: failed to marshal config for middleware %q: %v", ref.Name, err)
+				return nil, status.Errorf(status.ErrInternal, "ai: failed to marshal config for middleware %q: %w", ref.Name, err)
 			}
 			configJSON = b
 		}
 		h, err := d.buildFromJSON(ctx, configJSON)
 		if err != nil {
-			return nil, core.NewError(core.INVALID_ARGUMENT, "ai: failed to build middleware %q: %v", ref.Name, err)
+			return nil, wrapBuildError(ref.Name, err)
 		}
 		if h == nil {
-			return nil, core.NewError(core.INTERNAL, "ai: middleware %q factory returned nil", ref.Name)
+			return nil, status.Errorf(status.ErrInternal, "ai: middleware %q factory returned nil", ref.Name)
 		}
-		bundles = append(bundles, h)
+		bundles = append(bundles, namedHooks{name: ref.Name, hooks: h})
 	}
 	return bundles, nil
 }

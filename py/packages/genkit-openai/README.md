@@ -1,8 +1,37 @@
-# OpenAI API Compatible model provider Plugin
+# Genkit OpenAI Plugin
 
-> **Community Plugin** — This plugin is community-maintained and is not an
-> official Google or OpenAI product. It is provided on an "as-is" basis.
+OpenAI-compatible model provider for Genkit (OpenAI, Azure OpenAI, and other
+compatible endpoints).
+
+> **Building with a coding agent? Install the Genkit Python skill first.**
 >
-> **Preview** — This plugin is in preview and may have API changes in future releases.
+> ```bash
+> npx skills add genkit-ai/skills --skill developing-genkit-python
+> ```
+>
+> It teaches your agent the current Genkit Python APIs and common gotchas.
+> Source, manual install and skills for other languages:
+> [genkit-ai/skills](https://github.com/genkit-ai/skills).
 
-This Genkit plugin provides a set of tools and utilities for working with OpenAI.
+## Installation
+
+```bash
+uv add genkit-openai
+```
+
+## Usage
+
+```python
+from genkit import Genkit
+from genkit_openai import OpenAI
+
+ai = Genkit(plugins=[OpenAI()])
+
+res = await ai.generate(
+    model=OpenAI.gpt_model('gpt-5.2'),
+    prompt='Suggest 2 catchy names for an AI newsletter.',
+)
+print(res.text)
+```
+
+Set `OPENAI_API_KEY` in the environment, or pass `api_key=` to `OpenAI()`.

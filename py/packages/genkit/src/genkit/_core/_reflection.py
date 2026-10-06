@@ -26,27 +26,57 @@ import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
+from uuid import uuid4
 
 import uvicorn
 from pydantic import BaseModel
 from starlette.applications import Starlette
-from starlette.middleware import Middleware
-from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from genkit._core._action import Action
+from genkit._core._action import Action, BidiAction
 from genkit._core._constants import GENKIT_VERSION
 from genkit._core._error import get_reflection_json
 from genkit._core._logger import get_logger
 from genkit._core._middleware import GenerateMiddleware
+from genkit._core._model import AgentInit, AgentInput, ModelRef
 from genkit._core._registry import Registry
+from genkit._core._telemetry._http import connect_developer_ui_collector
 
 logger = get_logger(__name__)
 
 LifecycleHook = Callable[[], Awaitable[None]]
+
+
+def agent_has_server_store(action: Action) -> bool:
+    """True when the agent keeps session state on the server rather than the client."""
+    agent_meta = (action.metadata or {}).get('agent')
+    agent_dict = cast(dict[str, Any], agent_meta) if isinstance(agent_meta, dict) else {}
+    return agent_dict.get('stateManagement') == 'server'
+
+
+def resolve_agent_init(action: Action, init_val: object) -> AgentInit:
+    """Validate a raw init payload into an ``AgentInit``, normalized for the agent's store.
+
+    For a server-store agent we mint a session id when the caller didn't supply
+    one, and drop any caller-provided state — the store owns state, so a client
+    copy could otherwise overwrite the server's history with a stale snapshot.
+    """
+    init = AgentInit.model_validate(init_val) if isinstance(init_val, dict) else AgentInit()
+    if agent_has_server_store(action):
+        if not init.session_id and not init.snapshot_id:
+            init.session_id = str(uuid4())
+        init.state = None
+    return init
+
+
+def as_agent_input_dict(input_val: object) -> dict[str, Any]:
+    """Narrow a wire JSON value to an agent-input object."""
+    if isinstance(input_val, dict):
+        return cast(dict[str, Any], input_val)
+    raise TypeError(f'agent input must be a JSON object, got {type(input_val).__name__}')
 
 
 @dataclass
@@ -76,7 +106,8 @@ class ActionRunner:
 
     async def on_trace_start(self, tid: str, sid: str) -> None:
         self.trace_id, self.span_id = tid, sid
-        if task := asyncio.current_task():
+        # Empty ids aren't a run the Developer UI can cancel.
+        if tid and (task := asyncio.current_task()):
             self.active_actions[tid] = task
         self.trace_ready.set()
 
@@ -85,34 +116,55 @@ class ActionRunner:
             on_chunk = (
                 (
                     lambda c: self.queue.put_nowait(
-                        f'{c.model_dump_json() if isinstance(c, BaseModel) else json.dumps(c)}\n'
+                        (
+                            c.model_dump_json(by_alias=True, exclude_none=True)
+                            if isinstance(c, BaseModel)
+                            else json.dumps(c)
+                        )
+                        + '\n'
                     )
                 )
                 if self.stream
                 else None
             )
+            # A bidi action's fn already gives a single-turn view of a connection
+            # when driven through run() (seed one input, stream chunks, return the
+            # output), so the HTTP path just needs run(). The only bidi-specific
+            # step is normalizing the agent payload: minting a session id for a
+            # server-store agent and defaulting an absent turn to an empty input.
+            input_val = self.payload.get('input')
+            init = None
+            if isinstance(self.action, BidiAction):
+                init = resolve_agent_init(self.action, self.payload.get('init'))
+                if input_val is None:
+                    input_val = AgentInput()
+                else:
+                    input_val = AgentInput.model_validate(as_agent_input_dict(input_val))
+
             output = await self.action.run(
-                input=self.payload.get('input'),
+                input=input_val,
                 on_chunk=on_chunk,
                 context=self.payload.get('context', {}),
                 on_trace_start=self.on_trace_start,
                 telemetry_labels=self.payload.get('telemetryLabels'),
+                init=init,
             )
             result = (
                 output.response.model_dump(by_alias=True, exclude_none=True)
                 if isinstance(output.response, BaseModel)
                 else output.response
             )
-            self.queue.put_nowait(
-                json.dumps({
-                    'result': result,
-                    'telemetry': {'traceId': output.trace_id, 'spanId': output.span_id},
-                })
-            )
+            payload: dict[str, Any] = {'result': result}
+            if output.trace_id:
+                payload['telemetry'] = {'traceId': output.trace_id, 'spanId': output.span_id}
+            self.queue.put_nowait(json.dumps(payload))
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.exception('Error executing action')
+            # Dev UI already shows the error + stack from the reflection response.
+            # Dumping a full traceback here turns every playground failure into
+            # terminal noise.
+            logger.debug('Action failed: %s: %s', type(e).__name__, e, exc_info=True)
             self.queue.put_nowait(json.dumps({'error': get_reflection_json(e).model_dump(by_alias=True)}))
         finally:
             self.trace_ready.set()
@@ -124,7 +176,7 @@ class ActionRunner:
         task = asyncio.create_task(self.execute())
         await self.trace_ready.wait()
 
-        headers = {'x-genkit-version': version, 'Transfer-Encoding': 'chunked'}
+        headers = {'x-genkit-version': version}
         if self.trace_id:
             headers['X-Genkit-Trace-Id'] = self.trace_id
         if self.span_id:
@@ -153,7 +205,7 @@ def create_reflection_asgi_app(
         return JSONResponse({'status': 'OK'})
 
     async def terminate(_: Request) -> JSONResponse:
-        logger.info('Shutting down...')
+        logger.debug('Shutting down...')
         asyncio.get_running_loop().call_soon(os.kill, os.getpid(), signal.SIGTERM)
         return JSONResponse({'status': 'OK'})
 
@@ -196,6 +248,10 @@ def create_reflection_asgi_app(
                     )
                     serialized[key] = val.model_dump(by_alias=True, exclude_none=True, mode='json')
                 raw_values = serialized
+            elif type_param == 'defaultModel':
+                # Dev UI lists a model name. A stored ModelRef is an object;
+                # only the name is JSON-serializable here.
+                raw_values = {key: val.name if isinstance(val, ModelRef) else val for key, val in raw_values.items()}
             return JSONResponse(raw_values, headers={'x-genkit-version': version})
         except Exception:
             logger.exception('Reflection /api/values failed')
@@ -208,7 +264,18 @@ def create_reflection_asgi_app(
     async def envs(_: Request) -> JSONResponse:
         return JSONResponse(['dev'])
 
-    async def notify(_: Request) -> JSONResponse:
+    async def notify(req: Request) -> JSONResponse:
+        url: str | None = None
+        try:
+            body = await req.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            raw = body.get('telemetryServerUrl')
+            if isinstance(raw, str) and raw:
+                url = raw
+        if url:
+            connect_developer_ui_collector(url=url)
         return JSONResponse({}, headers={'x-genkit-version': version})
 
     async def cancel(req: Request) -> JSONResponse:
@@ -255,18 +322,8 @@ def create_reflection_asgi_app(
             Route('/api/runAction', run, methods=['POST']),
             Route('/api/cancelAction', cancel, methods=['POST']),
         ],
-        middleware=[
-            Middleware(
-                CORSMiddleware,  # type: ignore[arg-type]
-                allow_origins=['*'],
-                allow_methods=['*'],
-                allow_headers=['*'],
-                expose_headers=['X-Genkit-Trace-Id', 'X-Genkit-Span-Id', 'x-genkit-version'],
-            )
-        ],
         lifespan=lifespan,
     )
-    app.active_actions = active_actions  # type: ignore[attr-defined]
     return app
 
 

@@ -26,21 +26,23 @@ from unittest.mock import ANY, MagicMock, patch
 import pytest
 from pydantic import BaseModel, Field
 
-from genkit import Genkit, Message, MiddlewareRef, ModelResponse
+from genkit import Genkit, Message, ModelResponse, Part
 from genkit._ai._model import ModelRequest, text_from_message
 from genkit._ai._prompt import _parse_dotprompt_use, load_prompt_folder, lookup_prompt, prompt
-from genkit._ai._testing import (
-    EchoModel,
-    ProgrammableModel,
-    define_echo_model,
-    define_programmable_model,
-)
-from genkit._core._action import ActionKind
-from genkit._core._error import GenkitError
-from genkit._core._model import GenerateActionOptions, ModelConfig
-from genkit._core._typing import Part, Role, TextPart, ToolChoice
-from genkit.middleware import BaseMiddleware, GenerateMiddlewareContext, ModelHookParams
+from genkit._core._action import Action, ActionKind
+from genkit._core._dap import DapValue
+from genkit._core._error import GenkitError, RuntimeErrorReason
+from genkit._core._model import GenerateActionOptions, ModelConfig, resume_options_to_resume
+from genkit._core._registry import define_dynamic_action_provider
+from genkit._core._typing import Role
+from genkit.middleware import BaseMiddleware, GenerateMiddlewareContext, MiddlewareRef, ModelHookParams
 from genkit.plugin_api import MiddlewarePlugin, new_middleware
+from genkit.testing import (
+    EchoModel,
+    ScriptedModel,
+    define_echo_model,
+    define_scripted_model,
+)
 
 
 class _PreMiddleware(BaseMiddleware):
@@ -54,7 +56,7 @@ class _PreMiddleware(BaseMiddleware):
         return await next_fn(
             ModelHookParams(
                 request=ModelRequest(
-                    messages=[Message(role=Role.USER, content=[Part(TextPart(text=f'PRE {txt}'))])],
+                    messages=[Message(role=Role.USER, content=[Part.from_text(f'PRE {txt}')])],
                 ),
             ),
             ctx,
@@ -73,7 +75,7 @@ class _PostMiddleware(BaseMiddleware):
         txt = text_from_message(resp.message)
         return ModelResponse(
             finish_reason=resp.finish_reason,
-            message=Message(role=Role.USER, content=[Part(TextPart(text=f'{txt} POST'))]),
+            message=Message(role=Role.USER, content=[Part.from_text(f'{txt} POST')]),
         )
 
 
@@ -85,11 +87,11 @@ class PrePostMiddlewarePlugin(MiddlewarePlugin):
     ]
 
 
-def setup_test() -> tuple[Genkit, EchoModel, ProgrammableModel]:
+def setup_test() -> tuple[Genkit, EchoModel, ScriptedModel]:
     """Setup a test fixture for the prompt tests."""
     ai = Genkit(model='echoModel')
 
-    pm, _ = define_programmable_model(ai)
+    pm, _ = define_scripted_model(ai)
     echo, _ = define_echo_model(ai)
 
     return (ai, echo, pm)
@@ -100,7 +102,7 @@ async def test_simple_prompt() -> None:
     """Test simple prompt rendering."""
     ai, *_ = setup_test()
 
-    want_txt = '[ECHO] user: "hi" {"temperature":11.0}'
+    want_txt = '[ECHO] user: "hi" {"temperature":11}'
 
     my_prompt = ai.define_prompt(prompt='hi', config={'temperature': 11})
 
@@ -114,6 +116,14 @@ async def test_simple_prompt() -> None:
     assert (await result.response).text == want_txt
 
 
+def test_prompt_stream_does_not_accept_timeout() -> None:
+    """prompt.stream has no timeout=; the async for waits until generate finishes."""
+    ai = Genkit()
+    my_prompt = ai.define_prompt(prompt='hi')
+    with pytest.raises(TypeError, match='timeout'):
+        my_prompt.stream(timeout=5)  # type: ignore[call-arg]
+
+
 @pytest.mark.asyncio
 async def test_simple_prompt_with_override_config() -> None:
     """Test the config provided at render time is MERGED (not replaced) with prompt config.
@@ -123,9 +133,11 @@ async def test_simple_prompt_with_override_config() -> None:
     ai, *_ = setup_test()
 
     # Config is MERGED: prompt config (banana: true) + opts config (temperature: 12)
-    want_txt = '[ECHO] user: "hi" {"temperature":12.0,"banana":true}'
+    want_txt = '[ECHO] user: "hi" {"banana":true,"temperature":12}'
 
-    my_prompt = ai.define_prompt(prompt='hi', config={'banana': True})
+    # banana is a pass-through test key, not a ModelConfigDict field
+    prompt_config: dict[str, Any] = {'banana': True}
+    my_prompt = ai.define_prompt(prompt='hi', config=prompt_config)
 
     # Pass config via kwargs — this MERGES with prompt config
     response = await my_prompt(config={'temperature': 12})
@@ -136,6 +148,18 @@ async def test_simple_prompt_with_override_config() -> None:
     result = my_prompt.stream(config={'temperature': 12})
 
     assert (await result.response).text == want_txt
+
+
+@pytest.mark.asyncio
+async def test_prompt_tool_choice_string_reaches_the_model() -> None:
+    """A string tool_choice on the call overrides the prompt's and reaches the model."""
+    ai, *_ = setup_test()
+
+    my_prompt = ai.define_prompt(prompt='hi', tool_choice='required')
+    response = await my_prompt(tool_choice='none')
+
+    assert response.request is not None
+    assert response.request.tool_choice == 'none'
 
 
 @pytest.mark.asyncio
@@ -176,9 +200,9 @@ async def test_prompt_with_kitchensink() -> None:
     my_prompt = ai.define_prompt(
         system='pirate',
         prompt='hi',
-        messages=[Message(role=Role.USER, content=[Part(root=TextPart(text='history'))])],
+        messages=[Message(role=Role.USER, content=[Part.from_text('history')])],
         tools=['testTool'],
-        tool_choice=ToolChoice.REQUIRED,
+        tool_choice='required',
         max_turns=5,
         input_schema=PromptInput.model_json_schema(),
         output_constrained=True,
@@ -221,7 +245,7 @@ test_cases_parse_partial_json = [
         ModelConfig.model_validate({'temperature': 11}),
         {},
         # Config is MERGED: prompt config (banana: ripe) + opts config (temperature: 11)
-        """[ECHO] system: "hello foo (bar)" {"temperature":11.0,"banana":"ripe"}""",
+        """[ECHO] system: "hello foo (bar)" {"banana":"ripe","temperature":11.0}""",
     ),
     (
         'renders user prompt',
@@ -241,7 +265,7 @@ test_cases_parse_partial_json = [
         ModelConfig.model_validate({'temperature': 11}),
         {},
         # Config is MERGED: prompt config (banana: ripe) + opts config (temperature: 11)
-        """[ECHO] user: "hello foo (bar_system)" {"temperature":11.0,"banana":"ripe"}""",
+        """[ECHO] user: "hello foo (bar_system)" {"banana":"ripe","temperature":11.0}""",
     ),
     (
         'renders user prompt with context',
@@ -261,7 +285,7 @@ test_cases_parse_partial_json = [
         ModelConfig.model_validate({'temperature': 11}),
         {'auth': {'email': 'a@b.c'}},
         # Config is MERGED: prompt config (banana: ripe) + opts config (temperature: 11)
-        """[ECHO] user: "hello foo (bar, a@b.c)" {"temperature":11.0,"banana":"ripe"}""",
+        """[ECHO] user: "hello foo (bar, a@b.c)" {"banana":"ripe","temperature":11.0}""",
     ),
 ]
 
@@ -403,8 +427,8 @@ async def test_prompt_with_messages_list() -> None:
     ai, *_ = setup_test()
 
     messages = [
-        Message(role=Role.SYSTEM, content=[Part(root=TextPart(text='You are helpful'))]),
-        Message(role=Role.USER, content=[Part(root=TextPart(text='Hi there'))]),
+        Message(role=Role.SYSTEM, content=[Part.from_text('You are helpful')]),
+        Message(role=Role.USER, content=[Part.from_text('Hi there')]),
     ]
 
     my_prompt = ai.define_prompt(
@@ -424,8 +448,8 @@ async def test_messages_with_explicit_override() -> None:
     ai, *_ = setup_test()
 
     override_messages = [
-        Message(role=Role.USER, content=[Part(root=TextPart(text='First message'))]),
-        Message(role=Role.MODEL, content=[Part(root=TextPart(text='First response'))]),
+        Message(role=Role.USER, content=[Part.from_text('First message')]),
+        Message(role=Role.MODEL, content=[Part.from_text('First response')]),
     ]
 
     my_prompt = ai.define_prompt(
@@ -468,6 +492,33 @@ async def test_prompt_with_tools_list() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prompt_action_binds_dap_selector() -> None:
+    """PROMPT action expands ``mcp:tool/echo`` before resolve_tool."""
+    ai, *_ = setup_test()
+
+    async def echo_fn(x: str) -> str:
+        return x
+
+    echo = Action(name='echo', kind=ActionKind.TOOL, fn=echo_fn, metadata={'name': 'echo'})
+
+    async def dap_fn() -> DapValue:
+        return {'tool': [echo]}
+
+    define_dynamic_action_provider(ai.registry, 'mcp', dap_fn)
+
+    ai.define_prompt(name='withDap', prompt='ping', tools=['mcp:tool/echo'])
+    prompt_action = await ai.registry.resolve_action(ActionKind.PROMPT, 'withDap')
+    assert prompt_action is not None
+
+    result = await prompt_action.run()
+    request = result.response
+    assert isinstance(request, ModelRequest)
+    assert request.tools is not None
+    assert [t.name for t in request.tools] == ['echo']
+    assert 'echo' not in ai.registry._entries.get(ActionKind.TOOL, {})
+
+
+@pytest.mark.asyncio
 async def test_system_and_prompt_together() -> None:
     """Test rendering system, messages, and prompt in correct order."""
     ai, *_ = setup_test()
@@ -475,8 +526,8 @@ async def test_system_and_prompt_together() -> None:
     my_prompt = ai.define_prompt(
         system='System instruction',
         messages=[
-            Message(role=Role.USER, content=[Part(root=TextPart(text='History user'))]),
-            Message(role=Role.MODEL, content=[Part(root=TextPart(text='History model'))]),
+            Message(role=Role.USER, content=[Part.from_text('History user')]),
+            Message(role=Role.MODEL, content=[Part.from_text('History model')]),
         ],
         prompt='Final prompt',
     )
@@ -522,9 +573,11 @@ async def test_config_merge_priority() -> None:
     """
     ai, *_ = setup_test()
 
+    # banana is a pass-through test key, not a ModelConfigDict field
+    prompt_config: dict[str, Any] = {'temperature': 0.5, 'banana': 'yellow'}
     my_prompt = ai.define_prompt(
         prompt='test',
-        config={'temperature': 0.5, 'banana': 'yellow'},
+        config=prompt_config,
     )
 
     # New API: runtime config is MERGED with prompt config
@@ -544,7 +597,7 @@ async def test_opts_can_override_model() -> None:
     """Test that opts.model can override the prompt's default model."""
     ai, _, pm = setup_test()
 
-    pm.responses = [ModelResponse(message=Message(role=Role.MODEL, content=[Part(root=TextPart(text='pm response'))]))]
+    pm.responses = [ModelResponse(message=Message(role=Role.MODEL, content=[Part.from_text('pm response')]))]
 
     my_prompt = ai.define_prompt(
         model='echoModel',
@@ -552,9 +605,9 @@ async def test_opts_can_override_model() -> None:
     )
 
     # Override model via kwargs
-    response = await my_prompt(model='programmableModel')
+    response = await my_prompt(model='scriptedModel')
 
-    # Should use programmableModel, not echoModel
+    # Should use scriptedModel, not echoModel
     assert response.text == 'pm response'
 
 
@@ -569,8 +622,8 @@ async def test_opts_can_append_messages() -> None:
     )
 
     history_messages = [
-        Message(role=Role.USER, content=[Part(root=TextPart(text='Previous question'))]),
-        Message(role=Role.MODEL, content=[Part(root=TextPart(text='Previous answer'))]),
+        Message(role=Role.USER, content=[Part.from_text('Previous question')]),
+        Message(role=Role.MODEL, content=[Part.from_text('Previous answer')]),
     ]
 
     # Append conversation history via kwargs
@@ -890,9 +943,12 @@ def test_parse_dotprompt_use(raw: object, want: list[MiddlewareRef] | None) -> N
     ],
 )
 def test_parse_dotprompt_use_invalid(raw: object) -> None:
-    """Malformed frontmatter ``use`` raises a clear error."""
-    with pytest.raises(GenkitError):
+    """Malformed frontmatter ``use`` raises; reason is INVALID_INPUT."""
+    with pytest.raises(GenkitError) as raised:
         _parse_dotprompt_use(raw)
+    assert raised.value.status == 'INVALID_ARGUMENT'
+    assert raised.value.reason is RuntimeErrorReason.INVALID_INPUT
+    assert 'INVALID_INPUT' not in raised.value.original_message
 
 
 @pytest.mark.asyncio
@@ -925,12 +981,14 @@ async def test_load_prompt_with_use_middleware_not_registered() -> None:
         load_prompt_folder(ai.registry, prompt_dir)
 
         missing = await prompt(ai.registry, 'missing_mw')
-        with pytest.raises(GenkitError, match='missing_mw'):
+        with pytest.raises(GenkitError, match='missing_mw') as raised:
             await missing()
+        assert raised.value.reason is RuntimeErrorReason.INVALID_INPUT
+        assert 'INVALID_INPUT' not in raised.value.original_message
 
 
 @pytest.mark.asyncio
-async def test_load_prompt_with_use_middleware_invalid_shape() -> None:
+async def test_load_prompt_with_use_not_a_list_raises_invalid_input() -> None:
     """Non-list dotprompt ``use`` fails when the prompt is first resolved."""
     ai, *_ = setup_test()
 
@@ -940,8 +998,65 @@ async def test_load_prompt_with_use_middleware_invalid_shape() -> None:
         (prompt_dir / 'bad_use.prompt').write_text('---\nmodel: echoModel\nuse: not-a-list\n---\nhi\n')
         load_prompt_folder(ai.registry, prompt_dir)
 
-        with pytest.raises(GenkitError, match='must be a list'):
+        with pytest.raises(GenkitError, match='must be a list') as raised:
             await prompt(ai.registry, 'bad_use')
+        assert raised.value.status == 'INVALID_ARGUMENT'
+        assert raised.value.reason is RuntimeErrorReason.INVALID_INPUT
+        assert 'INVALID_INPUT' not in raised.value.original_message
+
+
+@pytest.mark.asyncio
+async def test_load_prompt_with_empty_use_entry_raises_invalid_input() -> None:
+    """An empty middleware name in dotprompt ``use`` fails when the prompt is resolved."""
+    ai, *_ = setup_test()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        prompt_dir = Path(tmpdir) / 'prompts'
+        prompt_dir.mkdir()
+        (prompt_dir / 'empty_use.prompt').write_text('---\nmodel: echoModel\nuse:\n  - ""\n---\nhi\n')
+        load_prompt_folder(ai.registry, prompt_dir)
+
+        with pytest.raises(GenkitError, match='empty string') as raised:
+            await prompt(ai.registry, 'empty_use')
+        assert raised.value.status == 'INVALID_ARGUMENT'
+        assert raised.value.reason is RuntimeErrorReason.INVALID_INPUT
+        assert 'INVALID_INPUT' not in raised.value.original_message
+
+
+@pytest.mark.asyncio
+async def test_load_prompt_with_use_missing_name_raises_invalid_input() -> None:
+    """A ``use`` map without ``name`` fails when the prompt is resolved."""
+    ai, *_ = setup_test()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        prompt_dir = Path(tmpdir) / 'prompts'
+        prompt_dir.mkdir()
+        (prompt_dir / 'no_name.prompt').write_text('---\nmodel: echoModel\nuse:\n  - config: x\n---\nhi\n')
+        load_prompt_folder(ai.registry, prompt_dir)
+
+        with pytest.raises(GenkitError, match='missing required `name`') as raised:
+            await prompt(ai.registry, 'no_name')
+        assert raised.value.status == 'INVALID_ARGUMENT'
+        assert raised.value.reason is RuntimeErrorReason.INVALID_INPUT
+        assert 'INVALID_INPUT' not in raised.value.original_message
+
+
+@pytest.mark.asyncio
+async def test_load_prompt_with_numeric_use_entry_raises_invalid_input() -> None:
+    """A non-string, non-map ``use`` entry fails when the prompt is resolved."""
+    ai, *_ = setup_test()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        prompt_dir = Path(tmpdir) / 'prompts'
+        prompt_dir.mkdir()
+        (prompt_dir / 'num_use.prompt').write_text('---\nmodel: echoModel\nuse:\n  - 42\n---\nhi\n')
+        load_prompt_folder(ai.registry, prompt_dir)
+
+        with pytest.raises(GenkitError, match='must be a string or map') as raised:
+            await prompt(ai.registry, 'num_use')
+        assert raised.value.status == 'INVALID_ARGUMENT'
+        assert raised.value.reason is RuntimeErrorReason.INVALID_INPUT
+        assert 'INVALID_INPUT' not in raised.value.original_message
 
 
 @pytest.mark.asyncio
@@ -998,18 +1113,24 @@ async def test_load_prompt_metadata_tool_defs_empty_array() -> None:
 @pytest.mark.asyncio
 async def test_define_prompt_primitive_with_output_instructions() -> None:
     """``define_prompt(registry, ...)`` primitive preserves output_instructions and injects on call."""
-    ai, *_ = setup_test()
+    ai, _, pm = setup_test()
+    pm.responses = [
+        ModelResponse(
+            finish_reason='stop',
+            message=Message(role='model', content=[Part.from_text('{"foo": 1}')]),
+        )
+    ]
 
     class TestSchema(BaseModel):
         foo: int | None = Field(None, description='foo field')
 
     def output_parts(resp: Any) -> list[Any]:
         msg = resp.request.messages[0]
-        return [p for p in msg.content if (p.root.metadata or {}).get('purpose') == 'output']
+        return [p for p in msg.content if (p.metadata or {}).get('purpose') == 'output']
 
     p_true = ai.define_prompt(
         name='p_true',
-        model='echoModel',
+        model='scriptedModel',
         prompt='hi',
         output_format='json',
         output_schema=TestSchema,
@@ -1022,7 +1143,7 @@ async def test_define_prompt_primitive_with_output_instructions() -> None:
     resp_true = await p_true()
     injected_true = output_parts(resp_true)
     assert len(injected_true) == 1
-    assert 'Output should be in JSON format and conform to the following schema' in (injected_true[0].root.text or '')
+    assert 'Output should be in JSON format and conform to the following schema' in (injected_true[0].text or '')
 
     p_custom = ai.define_prompt(
         name='p_custom',
@@ -1038,23 +1159,29 @@ async def test_define_prompt_primitive_with_output_instructions() -> None:
     resp_custom = await p_custom()
     injected_custom = output_parts(resp_custom)
     assert len(injected_custom) == 1
-    assert (injected_custom[0].root.text or '') == 'Only use single quotes in JSON keys if you dare'
+    assert (injected_custom[0].text or '') == 'Only use single quotes in JSON keys if you dare'
 
 
 @pytest.mark.asyncio
 async def test_load_prompt_with_output_instructions() -> None:
     """File-based (.prompt) dotprompts preserve output.instructions and inject on call."""
-    ai, *_ = setup_test()
+    ai, _, pm = setup_test()
+    pm.responses = [
+        ModelResponse(
+            finish_reason='stop',
+            message=Message(role='model', content=[Part.from_text('{"foo": 1}')]),
+        )
+    ]
 
     def output_parts(resp: Any) -> list[Any]:
         msg = resp.request.messages[0]
-        return [p for p in msg.content if (p.root.metadata or {}).get('purpose') == 'output']
+        return [p for p in msg.content if (p.metadata or {}).get('purpose') == 'output']
 
     with tempfile.TemporaryDirectory() as tmpdir:
         prompt_dir = Path(tmpdir) / 'prompts'
         prompt_dir.mkdir()
         (prompt_dir / 'with_instructions.prompt').write_text(
-            '---\nmodel: echoModel\noutput:\n  format: json\n  schema:\n'
+            '---\nmodel: scriptedModel\noutput:\n  format: json\n  schema:\n'
             '    type: object\n    properties:\n      foo:\n        type: integer\n'
             '  instructions: true\n---\nhi\n'
         )
@@ -1067,7 +1194,29 @@ async def test_load_prompt_with_output_instructions() -> None:
         assert rendered.output is not None
         assert rendered.output.instructions is True
 
-        resp = await loaded()
+        resp = await loaded(model='scriptedModel')
         injected = output_parts(resp)
         assert len(injected) == 1
-        assert 'Output should be in JSON format' in (injected[0].root.text or '')
+        assert 'Output should be in JSON format' in (injected[0].text or '')
+
+
+def test_resume_options_to_resume_carries_metadata() -> None:
+    """The flat ``resume_metadata`` kwarg is threaded onto ``Resume.metadata`` (not dropped)."""
+    restart = Part.from_tool_request(name='t', ref='r1', input={})
+    resume = resume_options_to_resume(resume_restart=restart, resume_metadata={'approved_by': 'test'})
+    assert resume is not None
+    assert resume.metadata == {'approved_by': 'test'}
+
+
+def test_resume_options_to_resume_metadata_only_still_builds() -> None:
+    """Even with only metadata (no respond/restart), a Resume is built so a stray
+    ``resume_metadata`` forces a resume (and fails loudly downstream) rather than being
+    silently dropped."""
+    resume = resume_options_to_resume(resume_metadata={'x': 1})
+    assert resume is not None
+    assert resume.metadata == {'x': 1}
+
+
+def test_resume_options_to_resume_none_when_all_empty() -> None:
+    """No respond, restart, or metadata -> no Resume."""
+    assert resume_options_to_resume() is None

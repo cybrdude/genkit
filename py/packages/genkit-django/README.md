@@ -1,11 +1,21 @@
 # Genkit Django Plugin
 
-`genkit-plugin-django` exposes Genkit flows as HTTP endpoints in a Django application. It mirrors `genkit-plugin-flask` and `genkit-plugin-fastapi`: one decorator turns a `@ai.flow()` into a Django view that speaks the Genkit HTTP protocol (JSON envelope, optional SSE streaming, structured error responses).
+`genkit-django` exposes Genkit flows as HTTP endpoints in a Django application. It mirrors `genkit-flask` and `genkit-fastapi`: one decorator turns a `@ai.flow()` into a Django view that speaks the Genkit HTTP protocol (JSON envelope, optional SSE streaming, structured error responses).
+
+> **Building with a coding agent? Install the Genkit Python skill first.**
+>
+> ```bash
+> npx skills add genkit-ai/skills --skill developing-genkit-python
+> ```
+>
+> It teaches your agent the current Genkit Python APIs and common gotchas.
+> Source, manual install and skills for other languages:
+> [genkit-ai/skills](https://github.com/genkit-ai/skills).
 
 ## Install
 
 ```bash
-pip install genkit-plugin-django
+uv add genkit-django
 ```
 
 ## Usage

@@ -68,6 +68,10 @@ export type ListTracesResponse = z.infer<typeof ListTracesResponseSchema>;
 export const LogQueryFilterSchema = z.object({
   traceId: z.string().optional(),
   spanId: z.string().optional(),
+  /** Filters logs by exact string match. Use for custom severity levels. */
+  severityText: z.string().optional(),
+  /** Filters logs to this numerical severity level and higher (>=). Used for standard OpenTelemetry severities. */
+  severityNumber: z.number().optional(),
 });
 
 export type LogQueryFilter = z.infer<typeof LogQueryFilterSchema>;
@@ -178,6 +182,25 @@ export const CreatePromptRequestSchema = z.object({
   config: GenerationCommonConfigSchema.passthrough().optional(),
   tools: z.array(ToolDefinitionSchema).optional(),
   use: z.array(MiddlewareRefSchema).optional(),
+  input: z
+    .object({
+      schema: z.unknown().optional(),
+      jsonSchema: z.unknown().optional(),
+      default: z.any().optional(),
+    })
+    .passthrough()
+    .optional(),
+  output: z
+    .object({
+      format: z.string().optional(),
+      // Resolved JSON Schema lives under jsonSchema for a generate action; a
+      // model request carries it under schema. Either is accepted.
+      jsonSchema: z.unknown().optional(),
+      schema: z.unknown().optional(),
+      contentType: z.string().optional(),
+    })
+    .passthrough()
+    .optional(),
 });
 
 export type CreatePromptRequest = z.infer<typeof CreatePromptRequestSchema>;

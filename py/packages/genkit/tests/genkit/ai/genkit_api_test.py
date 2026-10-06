@@ -10,9 +10,18 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from genkit import Genkit
-from genkit._core._action import _action_context
+from genkit import Genkit, get_logger
+from genkit._core._action import ActionRunContext, _action_context
+from genkit._core._error import GenkitError, RuntimeErrorReason
+from genkit._core._model import ModelRequest, ModelResponse
+from genkit._core._telemetry._log_exporter import build_log_record
 from genkit._core._typing import Operation
+from genkit.telemetry import (
+    SpanMetadata,
+    SpanNext,
+    configure_instrumentation,
+    reset_instrumentation,
+)
 
 
 @pytest.mark.asyncio
@@ -36,6 +45,58 @@ async def test_genkit_run() -> None:
 
     with pytest.raises(TypeError, match='fn must be a coroutine function'):
         await ai.run(name='test3', fn=sync_fn)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_genkit_run_tags_flow_step_action_type() -> None:
+    """ai.run tells the provider its span is a flow step, so traces can label it."""
+
+    class Recording:
+        last: SpanMetadata | None = None
+
+        async def run_in_new_span(self, metadata: SpanMetadata, next: SpanNext[str]) -> str:
+            self.last = metadata
+            return await next()
+
+    recording = Recording()
+    reset_instrumentation()
+    configure_instrumentation(recording)
+    try:
+        ai = Genkit()
+
+        async def step() -> str:
+            return 'ok'
+
+        assert await ai.run(name='lookup_account', fn=step) == 'ok'
+        assert recording.last is not None
+        assert recording.last.name == 'lookup_account'
+        assert recording.last.action_type == 'flowStep'
+    finally:
+        reset_instrumentation()
+
+
+@pytest.mark.asyncio
+async def test_get_logger_in_flow_attaches_trace_id(hex_ids: None) -> None:
+    """get_logger() lines inside a flow attach the flow's trace ID to the log record."""
+    ai = Genkit()
+    captured: list[dict[str, object]] = []
+
+    def capture_log(*, level: int, event: str, attrs: dict[str, object] | None = None) -> None:
+        captured.append(build_log_record(level=level, event=event, attrs=attrs or {}))
+
+    with mock.patch('genkit._core._telemetry._log_exporter.emit_log', side_effect=capture_log):
+
+        @ai.flow()
+        async def cart_flow() -> str:
+            get_logger(__name__).info('looked up cart')
+            return 'ok'
+
+        assert await cart_flow() == 'ok'
+
+    assert len(captured) == 1
+    assert captured[0]['body'] == {'stringValue': 'looked up cart'}
+    trace_id = captured[0].get('traceId')
+    assert isinstance(trace_id, str) and len(trace_id) == 32
 
 
 @pytest.mark.asyncio
@@ -67,19 +128,225 @@ async def test_genkit_check_operation_no_action() -> None:
     ai = Genkit()
     op = Operation(id='123', done=False)  # action is None
 
-    with pytest.raises(ValueError, match='Provided operation is missing original request information'):
+    with pytest.raises(GenkitError, match='Provided operation is missing original request information') as exc_info:
         await ai.check_operation(op)
+    assert exc_info.value.status == 'INVALID_ARGUMENT'
+    assert exc_info.value.reason is RuntimeErrorReason.INVALID_INPUT
+    assert 'INVALID_INPUT' not in exc_info.value.original_message
+
+
+@pytest.mark.asyncio
+async def test_genkit_check_operation_malformed_key_is_invalid_argument() -> None:
+    """A mangled action key on a reloaded handle is the caller's bad argument."""
+    ai = Genkit()
+    op = Operation(id='123', done=False, action='missing')
+
+    with pytest.raises(
+        GenkitError, match='Failed to resolve background action from original request: missing'
+    ) as exc_info:
+        await ai.check_operation(op)
+    assert exc_info.value.status == 'INVALID_ARGUMENT'
 
 
 @pytest.mark.asyncio
 async def test_genkit_check_operation_not_found() -> None:
     """Test Genkit.check_operation method with action not found."""
     ai = Genkit()
-    op = Operation(id='123', done=False, action='missing')
-    ai.registry.resolve_action_by_key = AsyncMock(return_value=None)  # type: ignore[assignment]
+    op = Operation(id='123', done=False, action='/background-model/nope')
 
-    with pytest.raises(ValueError, match='Failed to resolve background action from original request: missing'):
+    with pytest.raises(
+        GenkitError, match='Failed to resolve background action from original request: /background-model/nope'
+    ) as exc_info:
         await ai.check_operation(op)
+    assert exc_info.value.status == 'INVALID_ARGUMENT'
+
+
+@pytest.mark.asyncio
+async def test_check_operation_round_trips_persisted_dump() -> None:
+    """model_dump(by_alias=True) -> model_validate is the supported save/reload path."""
+    ai = Genkit()
+
+    async def start(_request: ModelRequest, _ctx: ActionRunContext) -> Operation:
+        return Operation(id='job-1', done=False)
+
+    async def check(op: Operation, _ctx: ActionRunContext) -> Operation:
+        return Operation(id=op.id, done=True)
+
+    ai.define_background_model(name='bg-rt', start=start, check=check)
+    op = Operation(id='job-1', done=False, action='/background-model/bg-rt')
+
+    reloaded = Operation.model_validate(op.model_dump(by_alias=True))
+    updated = await ai.check_operation(reloaded)
+
+    assert updated.done is True
+
+
+@pytest.mark.asyncio
+async def test_check_operation_dump_is_invalid_argument() -> None:
+    """A saved dict is not an Operation until model_validate."""
+    ai = Genkit()
+    dumped = {
+        'id': '123',
+        'done': False,
+        'action': '/background-model/test_action',
+    }
+
+    with pytest.raises(GenkitError, match='got a dump; pass Operation.model_validate') as exc_info:
+        await ai.check_operation(dumped)  # type: ignore[arg-type]
+    assert exc_info.value.status == 'INVALID_ARGUMENT'
+    assert exc_info.value.reason is RuntimeErrorReason.INVALID_INPUT
+    assert 'INVALID_INPUT' not in exc_info.value.original_message
+
+
+@pytest.mark.asyncio
+async def test_check_operation_boxed_response_is_invalid_argument() -> None:
+    """generate() returns a ModelResponse; the handle is response.operation."""
+    ai = Genkit()
+    boxed = ModelResponse(operation=Operation(id='123', action='/background-model/test_action'))
+
+    with pytest.raises(GenkitError, match='got ModelResponse; pass response.operation') as exc_info:
+        await ai.check_operation(boxed)  # type: ignore[arg-type]
+    assert exc_info.value.status == 'INVALID_ARGUMENT'
+    assert exc_info.value.reason is RuntimeErrorReason.INVALID_INPUT
+    assert 'INVALID_INPUT' not in exc_info.value.original_message
+
+
+@pytest.mark.asyncio
+async def test_check_operation_str_is_invalid_argument() -> None:
+    ai = Genkit()
+
+    with pytest.raises(GenkitError, match='got str, expected Operation') as exc_info:
+        await ai.check_operation('not-an-op')  # type: ignore[arg-type]
+    assert exc_info.value.status == 'INVALID_ARGUMENT'
+    assert exc_info.value.reason is RuntimeErrorReason.INVALID_INPUT
+    assert 'INVALID_INPUT' not in exc_info.value.original_message
+
+
+@pytest.mark.asyncio
+async def test_cancel_operation_round_trips_persisted_dump() -> None:
+    """Cancel accepts the same save/reload path as check."""
+    ai = Genkit()
+
+    async def start(_request: ModelRequest, _ctx: ActionRunContext) -> Operation:
+        return Operation(id='job-1', done=False)
+
+    async def check(op: Operation, _ctx: ActionRunContext) -> Operation:
+        return op
+
+    async def cancel(op: Operation, _ctx: ActionRunContext) -> Operation:
+        return Operation(id=op.id, done=True)
+
+    ai.define_background_model(name='bg-cancel-rt', start=start, check=check, cancel=cancel)
+    op = Operation(id='job-1', done=False, action='/background-model/bg-cancel-rt')
+
+    reloaded = Operation.model_validate(op.model_dump(by_alias=True))
+    updated = await ai.cancel_operation(reloaded)
+
+    assert updated.done is True
+
+
+@pytest.mark.asyncio
+async def test_cancel_operation_dump_is_invalid_argument() -> None:
+    ai = Genkit()
+    dumped = {
+        'id': '123',
+        'done': False,
+        'action': '/background-model/test_action',
+    }
+
+    with pytest.raises(GenkitError, match='got a dump; pass Operation.model_validate') as exc_info:
+        await ai.cancel_operation(dumped)  # type: ignore[arg-type]
+    assert exc_info.value.status == 'INVALID_ARGUMENT'
+    assert exc_info.value.reason is RuntimeErrorReason.INVALID_INPUT
+    assert 'INVALID_INPUT' not in exc_info.value.original_message
+
+
+@pytest.mark.asyncio
+async def test_cancel_operation_without_cancel_is_unimplemented() -> None:
+    """The wrapper's UNIMPLEMENTED propagates through the veneer unchanged."""
+
+    async def start(_request: ModelRequest, _ctx: ActionRunContext) -> Operation:
+        return Operation(id='123', done=False)
+
+    async def check(op: Operation, _ctx: ActionRunContext) -> Operation:
+        return op
+
+    ai = Genkit()
+    ai.define_background_model(name='veneer-no-cancel', start=start, check=check)
+    op = Operation(id='123', done=False, action='/background-model/veneer-no-cancel')
+
+    with pytest.raises(GenkitError, match='does not support cancellation') as exc_info:
+        await ai.cancel_operation(op)
+    assert exc_info.value.status == 'UNIMPLEMENTED'
+    assert exc_info.value.reason is RuntimeErrorReason.UNSUPPORTED_BY_MODEL
+    assert 'UNSUPPORTED_BY_MODEL' not in exc_info.value.original_message
+
+
+@pytest.mark.asyncio
+async def test_background_action_cancel_without_fn_is_unimplemented() -> None:
+    """A real no-cancel BackgroundAction raises UNIMPLEMENTED from .cancel."""
+
+    async def start(_request: ModelRequest, _ctx: ActionRunContext) -> Operation:
+        return Operation(id='1', done=False)
+
+    async def check(op: Operation, _ctx: ActionRunContext) -> Operation:
+        return op
+
+    ai = Genkit()
+    action = ai.define_background_model(name='no-cancel', start=start, check=check)
+    op = Operation(id='1', action='/background-model/no-cancel')
+
+    with pytest.raises(GenkitError, match='does not support cancellation') as exc_info:
+        await action.cancel(op)
+    assert exc_info.value.status == 'UNIMPLEMENTED'
+    assert exc_info.value.reason is RuntimeErrorReason.UNSUPPORTED_BY_MODEL
+    assert 'UNSUPPORTED_BY_MODEL' not in exc_info.value.original_message
+
+
+@pytest.mark.asyncio
+async def test_background_action_check_rejects_non_operation() -> None:
+    """BackgroundAction.check uses the same require_operation gate as the veneer."""
+
+    async def start(_request: ModelRequest, _ctx: ActionRunContext) -> Operation:
+        return Operation(id='1', done=False)
+
+    async def check(op: Operation, _ctx: ActionRunContext) -> Operation:
+        return op
+
+    ai = Genkit()
+    action = ai.define_background_model(name='bg-check', start=start, check=check)
+    dumped = {'id': '1', 'action': '/background-model/bg-check'}
+    boxed = ModelResponse(operation=Operation(id='1', action='/background-model/bg-check'))
+
+    with pytest.raises(GenkitError, match='got a dump; pass Operation.model_validate') as dump_exc:
+        await action.check(dumped)  # type: ignore[arg-type]
+    assert dump_exc.value.status == 'INVALID_ARGUMENT'
+
+    with pytest.raises(GenkitError, match='got ModelResponse; pass response.operation') as box_exc:
+        await action.check(boxed)  # type: ignore[arg-type]
+    assert box_exc.value.status == 'INVALID_ARGUMENT'
+
+    with pytest.raises(GenkitError, match='got str, expected Operation') as str_exc:
+        await action.check('not-an-op')  # type: ignore[arg-type]
+    assert str_exc.value.status == 'INVALID_ARGUMENT'
+
+
+@pytest.mark.asyncio
+async def test_background_action_cancel_rejects_non_operation() -> None:
+    """A dump must not AttributeError on .action before UNIMPLEMENTED."""
+
+    async def start(_request: ModelRequest, _ctx: ActionRunContext) -> Operation:
+        return Operation(id='1', done=False)
+
+    async def check(op: Operation, _ctx: ActionRunContext) -> Operation:
+        return op
+
+    ai = Genkit()
+    action = ai.define_background_model(name='no-cancel', start=start, check=check)
+
+    with pytest.raises(GenkitError, match='got a dump; pass Operation.model_validate') as exc_info:
+        await action.cancel({'id': '1', 'action': '/background-model/no-cancel'})  # type: ignore[arg-type]
+    assert exc_info.value.status == 'INVALID_ARGUMENT'
 
 
 @pytest.mark.asyncio
@@ -98,3 +365,40 @@ async def test_current_context() -> None:
         _action_context.reset(token)
 
     assert Genkit.current_context() is None
+
+
+def test_genkit_positional_argument_raises_type_error() -> None:
+    with pytest.raises(
+        TypeError,
+        match=(
+            r'Genkit\(\) takes no positional arguments, got 1\. '
+            r'Pass keyword arguments instead, e\.g\. '
+            r"Genkit\(model='googleai/gemini-flash-latest'\)\."
+        ),
+    ):
+        Genkit('googleai/gemini-flash-latest')  # type: ignore[reportCallIssue,too-many-positional-arguments]
+    with pytest.raises(
+        TypeError,
+        match=(
+            r'Genkit\(\) takes no positional arguments, got 1\. '
+            r'Pass keyword arguments instead, e\.g\. '
+            r'Genkit\(plugins=\[...\], model="..."\)\.'
+        ),
+    ):
+        Genkit([])  # type: ignore[reportCallIssue,too-many-positional-arguments]
+
+
+def test_genkit_path_string_does_not_suggest_model_kwarg() -> None:
+    with pytest.raises(TypeError) as exc_info:
+        Genkit('./prompts')  # type: ignore[reportCallIssue,too-many-positional-arguments]
+    message = str(exc_info.value)
+    assert "model='./prompts'" not in message
+    assert 'Genkit(plugins=[...], model="...")' in message
+
+
+def test_genkit_two_positional_args_says_got_2() -> None:
+    with pytest.raises(
+        TypeError,
+        match=r'Genkit\(\) takes no positional arguments, got 2\.',
+    ):
+        Genkit('googleai/gemini-flash-latest', [])  # type: ignore[reportCallIssue,too-many-positional-arguments]

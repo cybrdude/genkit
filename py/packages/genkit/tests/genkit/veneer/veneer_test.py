@@ -7,56 +7,59 @@
 
 import json
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Literal, cast
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from genkit import (
     Document,
     Genkit,
     Interrupt,
     Message,
-    MiddlewareRef,
     ModelResponse,
     ModelResponseChunk,
-    respond_to_interrupt,
+    Part,
 )
 from genkit._ai._formats._types import FormatDef, Formatter, FormatterConfig
 from genkit._ai._model import text_from_message
-from genkit._ai._testing import (
-    EchoModel,
-    ProgrammableModel,
-    define_echo_model,
-    define_programmable_model,
-)
 from genkit._core._action import ActionKind, ActionRunContext
-from genkit._core._model import ModelRequest
+from genkit._core._model import ModelRequest, OutputConfig
 from genkit._core._typing import (
     BaseDataPoint,
     Details,
-    DocumentPart,
     EvalFnResponse,
     EvalRequest,
     EvalResponse,
+    EvalStatusEnum,
     FinishReason,
     ModelInfo,
-    Part,
+    Operation,
     Role,
     Score,
     Supports,
-    TextPart,
-    ToolChoice,
     ToolDefinition,
     ToolRequest,
-    ToolRequestPart,
     ToolResponse,
-    ToolResponsePart,
 )
-from genkit.middleware import BaseMiddleware, GenerateMiddlewareContext, ModelHookParams
+from genkit.middleware import BaseMiddleware, GenerateMiddlewareContext, MiddlewareRef, ModelHookParams
+from genkit.testing import (
+    EchoModel,
+    ScriptedModel,
+    define_echo_model,
+    define_scripted_model,
+)
 
-# type SetupFixture = tuple[Genkit, EchoModel, ProgrammableModel]
-SetupFixture = tuple[Genkit, EchoModel, ProgrammableModel]
+# type SetupFixture = tuple[Genkit, EchoModel, ScriptedModel]
+SetupFixture = tuple[Genkit, EchoModel, ScriptedModel]
+
+
+def _ok_schema_response() -> ModelResponse:
+    """A reply that satisfies the TestSchema used by the output-config tests."""
+    return ModelResponse(
+        finish_reason=FinishReason.STOP,
+        message=Message(role=Role.MODEL, content=[Part.from_text('{"foo": 1, "bar": "x"}')]),
+    )
 
 
 @pytest.fixture
@@ -64,7 +67,7 @@ def setup_test() -> SetupFixture:
     """Setup a test fixture for the veneer tests."""
     ai = Genkit(model='echoModel')
 
-    pm, _ = define_programmable_model(ai)
+    pm, _ = define_scripted_model(ai)
     echo, _ = define_echo_model(ai)
 
     return (ai, echo, pm)
@@ -75,7 +78,7 @@ async def test_generate_uses_default_model(setup_test: SetupFixture) -> None:
     """Test that the generate function uses the default model."""
     ai, *_ = setup_test
 
-    want_txt = '[ECHO] user: "hi" {"temperature":11.0}'
+    want_txt = '[ECHO] user: "hi" {"temperature":11}'
 
     response = await ai.generate(prompt='hi', config={'temperature': 11})
 
@@ -84,6 +87,19 @@ async def test_generate_uses_default_model(setup_test: SetupFixture) -> None:
     stream_result = ai.generate_stream(prompt='hi', config={'temperature': 11})
 
     assert (await stream_result.response).text == want_txt
+
+
+@pytest.mark.asyncio
+async def test_generate_passes_through_camel_case_config_keys(setup_test: SetupFixture) -> None:
+    """Dict spellings are not rejected here; the plugin config schema decides."""
+    ai, echo, _ = setup_test
+
+    response = await ai.generate(prompt='hi', config={'maxOutputTokens': 100})
+
+    assert response.text.startswith('[ECHO] user: "hi"')
+    assert echo.last_request is not None
+    assert echo.last_request.config is not None
+    assert echo.last_request.config == {'maxOutputTokens': 100}
 
 
 @pytest.mark.asyncio
@@ -125,11 +141,11 @@ async def test_generate_with_explicit_model(setup_test: SetupFixture) -> None:
 
     response = await ai.generate(model='echoModel', prompt='hi', config={'temperature': 11})
 
-    assert response.text == '[ECHO] user: "hi" {"temperature":11.0}'
+    assert response.text == '[ECHO] user: "hi" {"temperature":11}'
 
     stream_result = ai.generate_stream(model='echoModel', prompt='hi', config={'temperature': 11})
 
-    assert (await stream_result.response).text == '[ECHO] user: "hi" {"temperature":11.0}'
+    assert (await stream_result.response).text == '[ECHO] user: "hi" {"temperature":11}'
 
 
 @pytest.mark.asyncio
@@ -139,7 +155,7 @@ async def test_generate_with_str_prompt(setup_test: SetupFixture) -> None:
 
     response = await ai.generate(prompt='hi', config={'temperature': 11})
 
-    assert response.text == '[ECHO] user: "hi" {"temperature":11.0}'
+    assert response.text == '[ECHO] user: "hi" {"temperature":11}'
 
 
 @pytest.mark.asyncio
@@ -147,13 +163,13 @@ async def test_generate_with_part_prompt(setup_test: SetupFixture) -> None:
     """Test that the generate function with a part prompt works."""
     ai, *_ = setup_test
 
-    want_txt = '[ECHO] user: "hi" {"temperature":11.0}'
+    want_txt = '[ECHO] user: "hi" {"temperature":11}'
 
-    response = await ai.generate(prompt=[Part(root=TextPart(text='hi'))], config={'temperature': 11})
+    response = await ai.generate(prompt=[Part.from_text('hi')], config={'temperature': 11})
 
     assert response.text == want_txt
 
-    stream_result = ai.generate_stream(prompt=[Part(root=TextPart(text='hi'))], config={'temperature': 11})
+    stream_result = ai.generate_stream(prompt=[Part.from_text('hi')], config={'temperature': 11})
 
     assert (await stream_result.response).text == want_txt
 
@@ -163,17 +179,17 @@ async def test_generate_with_part_list_prompt(setup_test: SetupFixture) -> None:
     """Test that the generate function with a list of parts prompt works."""
     ai, *_ = setup_test
 
-    want_txt = '[ECHO] user: "hello","world" {"temperature":11.0}'
+    want_txt = '[ECHO] user: "hello","world" {"temperature":11}'
 
     response = await ai.generate(
-        prompt=[Part(root=TextPart(text='hello')), Part(root=TextPart(text='world'))],
+        prompt=[Part.from_text('hello'), Part.from_text('world')],
         config={'temperature': 11},
     )
 
     assert response.text == want_txt
 
     stream_result = ai.generate_stream(
-        prompt=[Part(root=TextPart(text='hello')), Part(root=TextPart(text='world'))],
+        prompt=[Part.from_text('hello'), Part.from_text('world')],
         config={'temperature': 11},
     )
 
@@ -185,7 +201,7 @@ async def test_generate_with_str_system(setup_test: SetupFixture) -> None:
     """Test that the generate function with a string system works."""
     ai, *_ = setup_test
 
-    want_txt = '[ECHO] system: "talk like pirate" user: "hi" {"temperature":11.0}'
+    want_txt = '[ECHO] system: "talk like pirate" user: "hi" {"temperature":11}'
 
     response = await ai.generate(system='talk like pirate', prompt='hi', config={'temperature': 11})
 
@@ -201,10 +217,10 @@ async def test_generate_with_part_system(setup_test: SetupFixture) -> None:
     """Test that the generate function with a part system works."""
     ai, *_ = setup_test
 
-    want_txt = '[ECHO] system: "talk like pirate" user: "hi" {"temperature":11.0}'
+    want_txt = '[ECHO] system: "talk like pirate" user: "hi" {"temperature":11}'
 
     response = await ai.generate(
-        system=[Part(root=TextPart(text='talk like pirate'))],
+        system=[Part.from_text('talk like pirate')],
         prompt='hi',
         config={'temperature': 11},
     )
@@ -212,7 +228,7 @@ async def test_generate_with_part_system(setup_test: SetupFixture) -> None:
     assert response.text == want_txt
 
     stream_result = ai.generate_stream(
-        system=[Part(root=TextPart(text='talk like pirate'))],
+        system=[Part.from_text('talk like pirate')],
         prompt='hi',
         config={'temperature': 11},
     )
@@ -225,10 +241,10 @@ async def test_generate_with_part_list_system(setup_test: SetupFixture) -> None:
     """Test that the generate function with a list of parts system works."""
     ai, *_ = setup_test
 
-    want_txt = '[ECHO] system: "talk","like pirate" user: "hi" {"temperature":11.0}'
+    want_txt = '[ECHO] system: "talk","like pirate" user: "hi" {"temperature":11}'
 
     response = await ai.generate(
-        system=[Part(root=TextPart(text='talk')), Part(root=TextPart(text='like pirate'))],
+        system=[Part.from_text('talk'), Part.from_text('like pirate')],
         prompt='hi',
         config={'temperature': 11},
     )
@@ -236,7 +252,7 @@ async def test_generate_with_part_list_system(setup_test: SetupFixture) -> None:
     assert response.text == want_txt
 
     stream_result = ai.generate_stream(
-        system=[Part(root=TextPart(text='talk')), Part(root=TextPart(text='like pirate'))],
+        system=[Part.from_text('talk'), Part.from_text('like pirate')],
         prompt='hi',
         config={'temperature': 11},
     )
@@ -253,25 +269,25 @@ async def test_generate_with_messages(setup_test: SetupFixture) -> None:
         messages=[
             Message(
                 role=Role.USER,
-                content=[Part(root=TextPart(text='hi'))],
+                content=[Part.from_text('hi')],
             ),
         ],
         config={'temperature': 11},
     )
 
-    assert response.text == '[ECHO] user: "hi" {"temperature":11.0}'
+    assert response.text == '[ECHO] user: "hi" {"temperature":11}'
 
     stream_result = ai.generate_stream(
         messages=[
             Message(
                 role=Role.USER,
-                content=[Part(root=TextPart(text='hi'))],
+                content=[Part.from_text('hi')],
             ),
         ],
         config={'temperature': 11},
     )
 
-    assert (await stream_result.response).text == '[ECHO] user: "hi" {"temperature":11.0}'
+    assert (await stream_result.response).text == '[ECHO] user: "hi" {"temperature":11}'
 
 
 @pytest.mark.asyncio
@@ -289,11 +305,11 @@ async def test_generate_with_system_prompt_messages(
         messages=[
             Message(
                 role=Role.USER,
-                content=[Part(root=TextPart(text='hi'))],
+                content=[Part.from_text('hi')],
             ),
             Message(
                 role=Role.MODEL,
-                content=[Part(root=TextPart(text='bye'))],
+                content=[Part.from_text('bye')],
             ),
         ],
     )
@@ -306,11 +322,11 @@ async def test_generate_with_system_prompt_messages(
         messages=[
             Message(
                 role=Role.USER,
-                content=[Part(root=TextPart(text='hi'))],
+                content=[Part.from_text('hi')],
             ),
             Message(
                 role=Role.MODEL,
-                content=[Part(root=TextPart(text='bye'))],
+                content=[Part.from_text('bye')],
             ),
         ],
     )
@@ -334,11 +350,11 @@ async def test_generate_with_tools(setup_test: SetupFixture) -> None:
     response = await ai.generate(
         model='echoModel',
         prompt='hi',
-        tool_choice=ToolChoice.REQUIRED,
+        tool_choice='required',
         tools=['testTool'],
     )
 
-    want_txt = f'[ECHO] user: "hi" tools=testTool tool_choice={ToolChoice.REQUIRED}'
+    want_txt = '[ECHO] user: "hi" tools=testTool tool_choice=required'
 
     want_request = [
         ToolDefinition(
@@ -367,13 +383,36 @@ async def test_generate_with_tools(setup_test: SetupFixture) -> None:
     stream_result = ai.generate_stream(
         model='echoModel',
         prompt='hi',
-        tool_choice=ToolChoice.REQUIRED,
+        tool_choice='required',
         tools=['testTool'],
     )
 
     assert (await stream_result.response).text == want_txt
     assert echo.last_request is not None
     assert echo.last_request.tools == want_request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('choice', ['auto', 'required', 'none'])
+async def test_generate_tool_choice_string_reaches_the_model(
+    setup_test: SetupFixture, choice: Literal['auto', 'required', 'none']
+) -> None:
+    """A plain string tool_choice is what the model sees on its request."""
+    ai, *_ = setup_test
+
+    response = await ai.generate(model='echoModel', prompt='hi', tool_choice=choice)
+
+    assert response.request is not None
+    assert response.request.tool_choice == choice
+
+
+@pytest.mark.asyncio
+async def test_generate_unknown_tool_choice_raises_validation_error(setup_test: SetupFixture) -> None:
+    """A tool_choice outside auto/required/none fails before any model call."""
+    ai, *_ = setup_test
+
+    with pytest.raises(ValidationError, match="'auto', 'required' or 'none'"):
+        await ai.generate(model='echoModel', prompt='hi', tool_choice='sometimes')  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -397,16 +436,12 @@ async def test_generate_with_interrupting_tools(
         raise Interrupt({'banana': 'yes please'})
 
     tool_request_msg = Message(
-        Message(
-            role=Role.MODEL,
-            content=[
-                Part(root=TextPart(text='call these tools')),
-                Part(
-                    root=ToolRequestPart(tool_request=ToolRequest(input={'value': 5}, name='test_interrupt', ref='123'))
-                ),
-                Part(root=ToolRequestPart(tool_request=ToolRequest(input={'value': 5}, name='test_tool', ref='234'))),
-            ],
-        )
+        role=Role.MODEL,
+        content=[
+            Part.from_text('call these tools'),
+            Part(tool_request=ToolRequest(input={'value': 5}, name='test_interrupt', ref='123')),
+            Part(tool_request=ToolRequest(input={'value': 5}, name='test_tool', ref='234')),
+        ],
     )
     pm.responses.append(
         ModelResponse(
@@ -417,12 +452,12 @@ async def test_generate_with_interrupting_tools(
     pm.responses.append(
         ModelResponse(
             finish_reason=FinishReason.STOP,
-            message=Message(role=Role.MODEL, content=[Part(root=TextPart(text='tool called'))]),
+            message=Message(role=Role.MODEL, content=[Part.from_text('tool called')]),
         )
     )
 
     response = await ai.generate(
-        model='programmableModel',
+        model='scriptedModel',
         prompt='hi',
         tools=['test_tool', 'test_interrupt'],
     )
@@ -466,24 +501,18 @@ async def test_generate_with_interrupting_tools(
 
     assert response.text == 'call these tools'
     assert response.message == Message(
-        Message(
-            role=Role.MODEL,
-            content=[
-                Part(root=TextPart(text='call these tools')),
-                Part(
-                    root=ToolRequestPart(
-                        tool_request=ToolRequest(ref='123', name='test_interrupt', input={'value': 5}),
-                        metadata={'interrupt': {'banana': 'yes please'}},
-                    )
-                ),
-                Part(
-                    root=ToolRequestPart(
-                        tool_request=ToolRequest(ref='234', name='test_tool', input={'value': 5}),
-                        metadata={'pendingOutput': 12},
-                    )
-                ),
-            ],
-        )
+        role=Role.MODEL,
+        content=[
+            Part.from_text('call these tools'),
+            Part(
+                tool_request=ToolRequest(ref='123', name='test_interrupt', input={'value': 5}),
+                metadata={'interrupt': {'banana': 'yes please'}},
+            ),
+            Part(
+                tool_request=ToolRequest(ref='234', name='test_tool', input={'value': 5}),
+                metadata={'pendingOutput': 12},
+            ),
+        ],
     )
     assert pm.last_request is not None
     assert pm.last_request.tools == want_request
@@ -510,16 +539,12 @@ async def test_generate_with_interrupt_respond(
         raise Interrupt({'banana': 'yes please'})
 
     tool_request_msg = Message(
-        Message(
-            role=Role.MODEL,
-            content=[
-                Part(root=TextPart(text='call these tools')),
-                Part(
-                    root=ToolRequestPart(tool_request=ToolRequest(input={'value': 5}, name='test_interrupt', ref='123'))
-                ),
-                Part(root=ToolRequestPart(tool_request=ToolRequest(input={'value': 5}, name='test_tool', ref='234'))),
-            ],
-        )
+        role=Role.MODEL,
+        content=[
+            Part.from_text('call these tools'),
+            Part(tool_request=ToolRequest(input={'value': 5}, name='test_interrupt', ref='123')),
+            Part(tool_request=ToolRequest(input={'value': 5}, name='test_tool', ref='234')),
+        ],
     )
     pm.responses.append(
         ModelResponse(
@@ -530,12 +555,12 @@ async def test_generate_with_interrupt_respond(
     pm.responses.append(
         ModelResponse(
             finish_reason=FinishReason.STOP,
-            message=Message(role=Role.MODEL, content=[Part(root=TextPart(text='tool called'))]),
+            message=Message(role=Role.MODEL, content=[Part.from_text('tool called')]),
         )
     )
 
     interrupted_response = await ai.generate(
-        model='programmableModel',
+        model='scriptedModel',
         prompt='hi',
         tools=['test_tool', 'test_interrupt'],
     )
@@ -543,48 +568,40 @@ async def test_generate_with_interrupt_respond(
     assert interrupted_response.finish_reason == 'interrupted'
     assert interrupted_response.tool_requests == [
         Part(
-            root=ToolRequestPart(
-                tool_request=ToolRequest(ref='123', name='test_interrupt', input={'value': 5}),
-                metadata={'interrupt': {'banana': 'yes please'}},
-            ),
-        ).root,
+            tool_request=ToolRequest(ref='123', name='test_interrupt', input={'value': 5}),
+            metadata={'interrupt': {'banana': 'yes please'}},
+        ),
         Part(
-            root=ToolRequestPart(
-                tool_request=ToolRequest(ref='234', name='test_tool', input={'value': 5}),
-                metadata={'pendingOutput': 12},
-            ),
-        ).root,
+            tool_request=ToolRequest(ref='234', name='test_tool', input={'value': 5}),
+            metadata={'pendingOutput': 12},
+        ),
     ]
 
     assert interrupted_response.messages == [
         Message(
             role='user',
-            content=[Part(root=TextPart(text='hi'))],
+            content=[Part.from_text('hi')],
         ),
         Message(
             role='model',
             content=[
-                Part(root=TextPart(text='call these tools')),
+                Part.from_text('call these tools'),
                 Part(
-                    root=ToolRequestPart(
-                        tool_request=ToolRequest(ref='123', name='test_interrupt', input={'value': 5}),
-                        metadata={'interrupt': {'banana': 'yes please'}},
-                    )
+                    tool_request=ToolRequest(ref='123', name='test_interrupt', input={'value': 5}),
+                    metadata={'interrupt': {'banana': 'yes please'}},
                 ),
                 Part(
-                    root=ToolRequestPart(
-                        tool_request=ToolRequest(ref='234', name='test_tool', input={'value': 5}),
-                        metadata={'pendingOutput': 12},
-                    )
+                    tool_request=ToolRequest(ref='234', name='test_tool', input={'value': 5}),
+                    metadata={'pendingOutput': 12},
                 ),
             ],
         ),
     ]
 
-    respond_wrapped = respond_to_interrupt({'bar': 2}, interrupt=interrupted_response.interrupts[0])
-    assert isinstance(respond_wrapped, ToolResponsePart)
+    respond_wrapped = interrupted_response.interrupts[0].respond({'bar': 2})
+    assert type(respond_wrapped) is Part
     response = await ai.generate(
-        model='programmableModel',
+        model='scriptedModel',
         messages=interrupted_response.messages,
         resume_respond=[respond_wrapped],
         tools=['test_tool', 'test_interrupt'],
@@ -595,24 +612,17 @@ async def test_generate_with_interrupt_respond(
     assert response.messages == [
         Message(
             role=Role.USER,
-            content=[Part(root=TextPart(text='hi'))],
+            content=[Part.from_text('hi')],
         ),
         Message(
             role=Role.MODEL,
             content=[
-                Part(root=TextPart(text='call these tools')),
+                Part.from_text('call these tools'),
                 Part(
-                    root=ToolRequestPart(
-                        tool_request=ToolRequest(ref='123', name='test_interrupt', input={'value': 5}),
-                        metadata={'resolvedInterrupt': {'banana': 'yes please'}},
-                    )
+                    tool_request=ToolRequest(ref='123', name='test_interrupt', input={'value': 5}),
+                    metadata={'resolvedInterrupt': {'banana': 'yes please'}},
                 ),
-                Part(
-                    root=ToolRequestPart(
-                        tool_request=ToolRequest(ref='234', name='test_tool', input={'value': 5}),
-                        metadata=None,
-                    )
-                ),
+                Part(tool_request=ToolRequest(ref='234', name='test_tool', input={'value': 5}), metadata=None),
             ],
             metadata=None,
         ),
@@ -620,23 +630,18 @@ async def test_generate_with_interrupt_respond(
             role=Role.TOOL,
             content=[
                 Part(
-                    root=ToolResponsePart(
-                        tool_response=ToolResponse(ref='123', name='test_interrupt', output={'bar': 2}),
-                        metadata={'interruptResponse': True},
-                    )
+                    tool_response=ToolResponse(ref='123', name='test_interrupt', output={'bar': 2}),
+                    metadata={'interruptResponse': True},
                 ),
                 Part(
-                    root=ToolResponsePart(
-                        tool_response=ToolResponse(ref='234', name='test_tool', output=12),
-                        metadata={'source': 'pending'},
-                    )
+                    tool_response=ToolResponse(ref='234', name='test_tool', output=12), metadata={'source': 'pending'}
                 ),
             ],
             metadata={'resumed': True},
         ),
         Message(
             role=Role.MODEL,
-            content=[Part(root=TextPart(text='tool called'))],
+            content=[Part.from_text('tool called')],
             metadata=None,
         ),
     ]
@@ -656,12 +661,8 @@ async def test_generate_with_tools_and_output(setup_test: SetupFixture) -> None:
         return 'abc'
 
     tool_request_msg = Message(
-        Message(
-            role=Role.MODEL,
-            content=[
-                Part(root=ToolRequestPart(tool_request=ToolRequest(input={'value': 5}, name='testTool', ref='123')))
-            ],
-        )
+        role=Role.MODEL,
+        content=[Part(tool_request=ToolRequest(input={'value': 5}, name='testTool', ref='123'))],
     )
     pm.responses.append(
         ModelResponse(
@@ -672,25 +673,25 @@ async def test_generate_with_tools_and_output(setup_test: SetupFixture) -> None:
     pm.responses.append(
         ModelResponse(
             finish_reason=FinishReason.STOP,
-            message=Message(role=Role.MODEL, content=[Part(root=TextPart(text='tool called'))]),
+            message=Message(role=Role.MODEL, content=[Part.from_text('tool called')]),
         )
     )
 
     response = await ai.generate(
-        model='programmableModel',
+        model='scriptedModel',
         prompt='hi',
-        tool_choice=ToolChoice.REQUIRED,
+        tool_choice='required',
         tools=['testTool'],
     )
 
     assert response.text == 'tool called'
     assert response.request is not None
     assert response.request.messages is not None
-    assert response.request.messages[0] == Message(role=Role.USER, content=[Part(root=TextPart(text='hi'))])
+    assert response.request.messages[0] == Message(role=Role.USER, content=[Part.from_text('hi')])
     assert response.request.messages[1] == tool_request_msg
     assert response.request.messages[2] == Message(
         role=Role.TOOL,
-        content=[Part(root=ToolResponsePart(tool_response=ToolResponse(ref='123', name='testTool', output='abc')))],
+        content=[Part(tool_response=ToolResponse(ref='123', name='testTool', output='abc'))],
     )
     assert pm.last_request is not None
     assert pm.last_request.tools == [
@@ -728,12 +729,8 @@ async def test_generate_stream_with_tools(setup_test: SetupFixture) -> None:
         return 'abc'
 
     tool_request_msg = Message(
-        Message(
-            role=Role.MODEL,
-            content=[
-                Part(root=ToolRequestPart(tool_request=ToolRequest(input={'value': 5}, name='testTool', ref='123')))
-            ],
-        )
+        role=Role.MODEL,
+        content=[Part(tool_request=ToolRequest(input={'value': 5}, name='testTool', ref='123'))],
     )
     pm.responses.append(
         ModelResponse(
@@ -744,7 +741,7 @@ async def test_generate_stream_with_tools(setup_test: SetupFixture) -> None:
     pm.responses.append(
         ModelResponse(
             finish_reason=FinishReason.STOP,
-            message=Message(role=Role.MODEL, content=[Part(root=TextPart(text='tool called'))]),
+            message=Message(role=Role.MODEL, content=[Part.from_text('tool called')]),
         )
     )
     pm.chunks = [
@@ -754,13 +751,13 @@ async def test_generate_stream_with_tools(setup_test: SetupFixture) -> None:
                 content=tool_request_msg.content,
             )
         ],
-        [ModelResponseChunk(role=Role.MODEL, content=[Part(root=TextPart(text='tool called'))])],
+        [ModelResponseChunk(role=Role.MODEL, content=[Part.from_text('tool called')])],
     ]
 
     stream_result = ai.generate_stream(
-        model='programmableModel',
+        model='scriptedModel',
         prompt='hi',
-        tool_choice=ToolChoice.REQUIRED,
+        tool_choice='required',
         tools=['testTool'],
     )
 
@@ -770,9 +767,16 @@ async def test_generate_stream_with_tools(setup_test: SetupFixture) -> None:
         if chunk.role:
             summary += f'{chunk.role} '
         for p in chunk.content:
-            summary += str(type(p.root).__name__)
-            if isinstance(p.root, TextPart):
-                summary += f' {p.root.text}'
+            if p.tool_request is not None:
+                summary += 'ToolRequestPart'
+            elif p.tool_response is not None:
+                summary += 'ToolResponsePart'
+            elif p.text is not None:
+                summary += 'TextPart'
+            else:
+                summary += type(p).__name__
+            if p.text is not None:
+                summary += f' {p.text}'
         chunks.append(summary)
 
     response = await stream_result.response
@@ -780,11 +784,11 @@ async def test_generate_stream_with_tools(setup_test: SetupFixture) -> None:
     assert response.text == 'tool called'
     assert response.request is not None
     assert response.request.messages is not None
-    assert response.request.messages[0] == Message(role=Role.USER, content=[Part(root=TextPart(text='hi'))])
+    assert response.request.messages[0] == Message(role=Role.USER, content=[Part.from_text('hi')])
     assert response.request.messages[1] == tool_request_msg
     assert response.request.messages[2] == Message(
         role=Role.TOOL,
-        content=[Part(root=ToolResponsePart(tool_response=ToolResponse(ref='123', name='testTool', output='abc')))],
+        content=[Part(tool_response=ToolResponse(ref='123', name='testTool', output='abc'))],
     )
     assert chunks == [
         'model ToolRequestPart',
@@ -803,17 +807,17 @@ async def test_generate_stream_no_need_to_await_response(
     pm.responses.append(
         ModelResponse(
             finish_reason=FinishReason.STOP,
-            message=Message(role=Role.MODEL, content=[Part(root=TextPart(text='something else'))]),
+            message=Message(role=Role.MODEL, content=[Part.from_text('something else')]),
         )
     )
     pm.chunks = [
         [
-            ModelResponseChunk(role=Role.MODEL, content=[Part(root=TextPart(text='h'))]),
-            ModelResponseChunk(role=Role.MODEL, content=[Part(root=TextPart(text='i'))]),
+            ModelResponseChunk(role=Role.MODEL, content=[Part.from_text('h')]),
+            ModelResponseChunk(role=Role.MODEL, content=[Part.from_text('i')]),
         ],
     ]
 
-    stream_result = ai.generate_stream(model='programmableModel', prompt='do it')
+    stream_result = ai.generate_stream(model='scriptedModel', prompt='do it')
     chunks = ''
     async for chunk in stream_result.stream:
         chunks += chunk.text
@@ -823,7 +827,8 @@ async def test_generate_stream_no_need_to_await_response(
 @pytest.mark.asyncio
 async def test_generate_with_output(setup_test: SetupFixture) -> None:
     """Test that the generate function with output works."""
-    ai, *_ = setup_test
+    ai, _, pm, *_ = setup_test
+    pm.responses = [_ok_schema_response(), _ok_schema_response()]
 
     class TestSchema(BaseModel):
         foo: int | None = Field(None, description='foo field')
@@ -849,18 +854,20 @@ async def test_generate_with_output(setup_test: SetupFixture) -> None:
     }
     want = ModelRequest(
         messages=[
-            Message(role=Role.USER, content=[Part(root=TextPart(text='hi'))]),
+            Message(role=Role.USER, content=[Part.from_text('hi')]),
         ],
         config={},  # type: ignore[arg-type]
         tools=[],
-        output_format='json',
-        output_schema=_schema,
-        output_constrained=True,
-        output_content_type='application/json',
+        output=OutputConfig(
+            format='json',
+            json_schema=_schema,
+            constrained=True,
+            content_type='application/json',
+        ),
     )
 
     response = await ai.generate(
-        model='echoModel',
+        model='scriptedModel',
         prompt='hi',
         output_schema=TestSchema,
         output_format='json',
@@ -872,7 +879,7 @@ async def test_generate_with_output(setup_test: SetupFixture) -> None:
     assert response.request == want
 
     stream_result = ai.generate_stream(
-        model='echoModel',
+        model='scriptedModel',
         prompt='hi',
         output_schema=TestSchema,
         output_format='json',
@@ -889,7 +896,8 @@ async def test_generate_defaults_to_json_format(
     setup_test: SetupFixture,
 ) -> None:
     """When Output is provided, format will default to json."""
-    ai, *_ = setup_test
+    ai, _, pm, *_ = setup_test
+    pm.responses = [_ok_schema_response(), _ok_schema_response()]
 
     class TestSchema(BaseModel):
         foo: int | None = Field(None, description='foo field')
@@ -915,19 +923,21 @@ async def test_generate_defaults_to_json_format(
     }
     want = ModelRequest(
         messages=[
-            Message(role=Role.USER, content=[Part(root=TextPart(text='hi'))]),
+            Message(role=Role.USER, content=[Part.from_text('hi')]),
         ],
         config={},  # type: ignore[arg-type]
         tools=[],
-        output_format='json',
-        output_schema=_schema,
-        # these get populated by the format
-        output_constrained=True,
-        output_content_type='application/json',
+        output=OutputConfig(
+            format='json',
+            json_schema=_schema,
+            # these get populated by the format
+            constrained=True,
+            content_type='application/json',
+        ),
     )
 
     response = await ai.generate(
-        model='echoModel',
+        model='scriptedModel',
         prompt='hi',
         output_schema=TestSchema,
     )
@@ -935,7 +945,7 @@ async def test_generate_defaults_to_json_format(
     assert response.request == want
 
     stream_result = ai.generate_stream(
-        model='echoModel',
+        model='scriptedModel',
         prompt='hi',
         output_schema=TestSchema,
     )
@@ -948,7 +958,8 @@ async def test_generate_json_format_unconstrained(
     setup_test: SetupFixture,
 ) -> None:
     """When Output is provided, format will default to json."""
-    ai, *_ = setup_test
+    ai, _, pm, *_ = setup_test
+    pm.responses = [_ok_schema_response(), _ok_schema_response()]
 
     class TestSchema(BaseModel):
         foo: int | None = Field(None, description='foo field')
@@ -956,35 +967,37 @@ async def test_generate_json_format_unconstrained(
 
     want = ModelRequest(
         messages=[
-            Message(role=Role.USER, content=[Part(root=TextPart(text='hi'))]),
+            Message(role=Role.USER, content=[Part.from_text('hi')]),
         ],
         config={},  # type: ignore[arg-type]
         tools=[],
-        output_format='json',
-        output_schema={
-            'properties': {
-                'foo': {
-                    'anyOf': [{'type': 'integer'}, {'type': 'null'}],
-                    'default': None,
-                    'description': 'foo field',
-                    'title': 'Foo',
+        output=OutputConfig(
+            format='json',
+            json_schema={
+                'properties': {
+                    'foo': {
+                        'anyOf': [{'type': 'integer'}, {'type': 'null'}],
+                        'default': None,
+                        'description': 'foo field',
+                        'title': 'Foo',
+                    },
+                    'bar': {
+                        'anyOf': [{'type': 'string'}, {'type': 'null'}],
+                        'default': None,
+                        'description': 'bar field',
+                        'title': 'Bar',
+                    },
                 },
-                'bar': {
-                    'anyOf': [{'type': 'string'}, {'type': 'null'}],
-                    'default': None,
-                    'description': 'bar field',
-                    'title': 'Bar',
-                },
+                'title': 'TestSchema',
+                'type': 'object',
             },
-            'title': 'TestSchema',
-            'type': 'object',
-        },
-        output_constrained=False,
-        output_content_type='application/json',
+            constrained=False,
+            content_type='application/json',
+        ),
     )
 
     response = await ai.generate(
-        model='echoModel',
+        model='scriptedModel',
         prompt='hi',
         output_schema=TestSchema,
         output_constrained=False,
@@ -993,7 +1006,7 @@ async def test_generate_json_format_unconstrained(
     assert response.request == want
 
     stream_result = ai.generate_stream(
-        model='echoModel',
+        model='scriptedModel',
         prompt='hi',
         output_schema=TestSchema,
         output_constrained=False,
@@ -1006,7 +1019,7 @@ async def test_generate_json_format_unconstrained(
 async def test_generate_with_middleware() -> None:
     """When middleware is provided, applies it."""
     ai = Genkit(model='echoModel')
-    define_programmable_model(ai)
+    define_scripted_model(ai)
     define_echo_model(ai)
 
     @ai.middleware(name='pre_mw')
@@ -1022,7 +1035,7 @@ async def test_generate_with_middleware() -> None:
                 ModelHookParams(
                     request=ModelRequest(
                         messages=[
-                            Message(role=Role.USER, content=[Part(root=TextPart(text=f'PRE {txt}'))]),
+                            Message(role=Role.USER, content=[Part.from_text(f'PRE {txt}')]),
                         ],
                     ),
                 ),
@@ -1042,7 +1055,7 @@ async def test_generate_with_middleware() -> None:
             txt = text_from_message(resp.message)
             return ModelResponse(
                 finish_reason=resp.finish_reason,
-                message=Message(role=Role.USER, content=[Part(root=TextPart(text=f'{txt} POST'))]),
+                message=Message(role=Role.USER, content=[Part.from_text(f'{txt} POST')]),
             )
 
     want = '[ECHO] user: "PRE hi" POST'
@@ -1068,7 +1081,7 @@ async def test_generate_with_middleware() -> None:
 async def test_generate_passes_through_current_action_context() -> None:
     """Test that generate uses current action context by default."""
     ai = Genkit(model='echoModel')
-    define_programmable_model(ai)
+    define_scripted_model(ai)
     define_echo_model(ai)
 
     @ai.middleware(name='inject_ctx')
@@ -1086,7 +1099,7 @@ async def test_generate_passes_through_current_action_context() -> None:
                         messages=[
                             Message(
                                 role=Role.USER,
-                                content=[Part(root=TextPart(text=f'{txt} {ctx.custom_context}'))],
+                                content=[Part.from_text(f'{txt} {ctx.custom_context}')],
                             ),
                         ],
                     ),
@@ -1111,7 +1124,7 @@ async def test_generate_passes_through_current_action_context() -> None:
 async def test_generate_uses_explicitly_passed_in_context() -> None:
     """Generate uses specific context instead of current action context."""
     ai = Genkit(model='echoModel')
-    define_programmable_model(ai)
+    define_scripted_model(ai)
     define_echo_model(ai)
 
     @ai.middleware(name='inject_ctx')
@@ -1129,7 +1142,7 @@ async def test_generate_uses_explicitly_passed_in_context() -> None:
                         messages=[
                             Message(
                                 role=Role.USER,
-                                content=[Part(root=TextPart(text=f'{txt} {ctx.custom_context}'))],
+                                content=[Part.from_text(f'{txt} {ctx.custom_context}')],
                             ),
                         ],
                     ),
@@ -1155,7 +1168,7 @@ async def test_generate_uses_explicitly_passed_in_context() -> None:
 async def test_generate_uses_inline_middleware_instance_with_context() -> None:
     """Test that generate works with inline middleware instances directly (no registration needed)."""
     ai = Genkit(model='echoModel')
-    define_programmable_model(ai)
+    define_scripted_model(ai)
     define_echo_model(ai)
 
     class InjectContextMiddleware(BaseMiddleware):
@@ -1172,7 +1185,7 @@ async def test_generate_uses_inline_middleware_instance_with_context() -> None:
                         messages=[
                             Message(
                                 role=Role.USER,
-                                content=[Part(root=TextPart(text=f'{txt} {ctx.custom_context}'))],
+                                content=[Part.from_text(f'{txt} {ctx.custom_context}')],
                             ),
                         ],
                     ),
@@ -1199,7 +1212,8 @@ async def test_generate_json_format_unconstrained_with_instructions(
     setup_test: SetupFixture,
 ) -> None:
     """When output_instructions is provided, instructions are injected."""
-    ai, *_ = setup_test
+    ai, _, pm, *_ = setup_test
+    pm.responses = [_ok_schema_response(), _ok_schema_response()]
 
     class TestSchema(BaseModel):
         foo: int | None = Field(None, description='foo field')
@@ -1226,43 +1240,40 @@ async def test_generate_json_format_unconstrained_with_instructions(
             Message(
                 role=Role.USER,
                 content=[
-                    Part(root=TextPart(text='hi')),
-                    Part(
-                        root=TextPart(
-                            text=instructions_text,
-                            metadata={'purpose': 'output'},
-                        )
-                    ),
+                    Part.from_text('hi'),
+                    Part.from_text(instructions_text, metadata={'purpose': 'output'}),
                 ],
             )
         ],
         config={},  # type: ignore[arg-type]
         tools=[],
-        output_format='json',
-        output_schema={
-            'properties': {
-                'foo': {
-                    'anyOf': [{'type': 'integer'}, {'type': 'null'}],
-                    'default': None,
-                    'description': 'foo field',
-                    'title': 'Foo',
+        output=OutputConfig(
+            format='json',
+            json_schema={
+                'properties': {
+                    'foo': {
+                        'anyOf': [{'type': 'integer'}, {'type': 'null'}],
+                        'default': None,
+                        'description': 'foo field',
+                        'title': 'Foo',
+                    },
+                    'bar': {
+                        'anyOf': [{'type': 'string'}, {'type': 'null'}],
+                        'default': None,
+                        'description': 'bar field',
+                        'title': 'Bar',
+                    },
                 },
-                'bar': {
-                    'anyOf': [{'type': 'string'}, {'type': 'null'}],
-                    'default': None,
-                    'description': 'bar field',
-                    'title': 'Bar',
-                },
+                'title': 'TestSchema',
+                'type': 'object',
             },
-            'title': 'TestSchema',
-            'type': 'object',
-        },
-        output_constrained=False,
-        output_content_type='application/json',
+            constrained=False,
+            content_type='application/json',
+        ),
     )
 
     response = await ai.generate(
-        model='echoModel',
+        model='scriptedModel',
         prompt='hi',
         output_schema=TestSchema,
         output_constrained=False,
@@ -1272,7 +1283,7 @@ async def test_generate_json_format_unconstrained_with_instructions(
     assert response.request == want
 
     stream_result = ai.generate_stream(
-        model='echoModel',
+        model='scriptedModel',
         prompt='hi',
         output_schema=TestSchema,
         output_constrained=False,
@@ -1292,18 +1303,19 @@ async def test_generate_output_instructions_true_injects_standard(
     passing ``True`` is how a caller opts back into the schema instructions -- e.g.
     when running unconstrained against a model without native structured output.
     """
-    ai, *_ = setup_test
+    ai, _, pm, *_ = setup_test
+    pm.responses = [_ok_schema_response(), _ok_schema_response()]
 
     class TestSchema(BaseModel):
         foo: int | None = Field(None, description='foo field')
 
     def output_parts(resp: Any) -> list[Part]:
         msg = resp.request.messages[0]
-        return [p for p in msg.content if (p.root.metadata or {}).get('purpose') == 'output']
+        return [p for p in msg.content if (p.metadata or {}).get('purpose') == 'output']
 
     # True -> the standard schema preamble is injected.
     on = await ai.generate(
-        model='echoModel',
+        model='scriptedModel',
         prompt='hi',
         output_schema=TestSchema,
         output_constrained=False,
@@ -1311,12 +1323,12 @@ async def test_generate_output_instructions_true_injects_standard(
     )
     injected = output_parts(on)
     assert len(injected) == 1
-    injected_text = injected[0].root.text or ''
+    injected_text = injected[0].text or ''
     assert 'Output should be in JSON format and conform to the following schema' in injected_text
 
     # Unset -> json's default (False) means nothing is injected.
     off = await ai.generate(
-        model='echoModel',
+        model='scriptedModel',
         prompt='hi',
         output_schema=TestSchema,
         output_constrained=False,
@@ -1329,49 +1341,45 @@ async def test_generate_simulates_doc_grounding(
     setup_test: SetupFixture,
 ) -> None:
     """Test that generate simulates doc grounding."""
-    ai, *_ = setup_test
+    ai, echo, _pm = setup_test
 
-    want_msg = Message(
+    grounded_msg = Message(
         role=Role.USER,
         content=[
-            Part(root=TextPart(text='hi')),
-            Part(
-                root=TextPart(
-                    text='\n\nUse the following information to complete your task:' + '\n\n- [0]: doc content 1\n\n',
-                    metadata={'purpose': 'context'},
-                )
+            Part.from_text('hi'),
+            Part.from_text(
+                '\n\nUse the following information to complete your task:' + '\n\n- [0]: doc content 1\n\n',
+                metadata={'purpose': 'context'},
             ),
         ],
     )
+    clean_msg = Message(role=Role.USER, content=[Part.from_text('hi')])
 
     response = await ai.generate(
-        messages=[
-            Message(
-                role=Role.USER,
-                content=[Part(root=TextPart(text='hi'))],
-            ),
-        ],
-        docs=[Document(content=[DocumentPart(root=TextPart(text='doc content 1'))])],
+        messages=[clean_msg],
+        docs=[Document(content=[Part.from_text('doc content 1')])],
     )
 
+    # the model receives the grounded prompt; the returned request reports the
+    # clean conversation we persist, with docs still attached as structured data.
+    assert echo.last_request is not None
+    assert echo.last_request.messages[0] == grounded_msg
     assert response.request is not None
     assert response.request.messages is not None
-    assert response.request.messages[0] == want_msg
+    assert response.request.messages[0] == clean_msg
+    assert response.request.docs is not None
 
     stream_result = ai.generate_stream(
-        messages=[
-            Message(
-                role=Role.USER,
-                content=[Part(root=TextPart(text='hi'))],
-            ),
-        ],
-        docs=[Document(content=[DocumentPart(root=TextPart(text='doc content 1'))])],
+        messages=[clean_msg],
+        docs=[Document(content=[Part.from_text('doc content 1')])],
     )
 
     resp = await stream_result.response
+    assert echo.last_request is not None
+    assert echo.last_request.messages[0] == grounded_msg
     assert resp.request is not None
     assert resp.request.messages is not None
-    assert resp.request.messages[0] == want_msg
+    assert resp.request.messages[0] == clean_msg
 
 
 class MockBananaFormat(FormatDef):
@@ -1391,14 +1399,16 @@ class MockBananaFormat(FormatDef):
     def handle(self, schema: dict[str, Any] | None) -> Formatter:
         """Handle the format."""
 
-        def message_parser(msg: Message) -> str:
+        def message_parser(msg: Message) -> Any:  # noqa: ANN401
             """Parse the message."""
-            parts = [p.root.text or '' for p in msg.content if hasattr(p.root, 'text') and p.root.text]
-            return f'banana {"".join(parts)}'  # type: ignore[arg-type]
+            parts = [p.text or '' for p in msg.content if p.text is not None and p.text]
+            if schema:
+                return {'foo': 1, 'bar': f'banana {"".join(parts)}'}
+            return f'banana {"".join(parts)}'
 
         def chunk_parser(chunk: ModelResponseChunk) -> str:
             """Parse the chunk."""
-            parts = [p.root.text or '' for p in chunk.content if hasattr(p.root, 'text') and p.root.text]
+            parts = [p.text or '' for p in chunk.content if p.text is not None and p.text]
             return f'banana chunk {"".join(parts)}'  # type: ignore[arg-type]
 
         instructions: str | None = None
@@ -1428,22 +1438,22 @@ async def test_define_format(setup_test: SetupFixture) -> None:
         (
             ModelResponse(
                 finish_reason=FinishReason.STOP,
-                message=Message(role=Role.MODEL, content=[Part(root=TextPart(text='model says'))]),
+                message=Message(role=Role.MODEL, content=[Part.from_text('model says')]),
             )
         )
     ]
     pm.chunks = [
         [
-            ModelResponseChunk(role=Role.MODEL, content=[Part(root=TextPart(text='1'))]),
-            ModelResponseChunk(role=Role.MODEL, content=[Part(root=TextPart(text='2'))]),
-            ModelResponseChunk(role=Role.MODEL, content=[Part(root=TextPart(text='3'))]),
+            ModelResponseChunk(role=Role.MODEL, content=[Part.from_text('1')]),
+            ModelResponseChunk(role=Role.MODEL, content=[Part.from_text('2')]),
+            ModelResponseChunk(role=Role.MODEL, content=[Part.from_text('3')]),
         ]
     ]
 
     chunks = []
 
     stream_result = ai.generate_stream(
-        model='programmableModel',
+        model='scriptedModel',
         prompt='hi',
         output_schema=TestSchema,
         output_format='banana',
@@ -1454,7 +1464,7 @@ async def test_define_format(setup_test: SetupFixture) -> None:
 
     response = await stream_result.response
 
-    assert response.output == 'banana model says'
+    assert response.output == TestSchema(foo=1, bar='banana model says')
     assert chunks == ['banana chunk 1', 'banana chunk 2', 'banana chunk 3']
 
     assert response.request == ModelRequest(
@@ -1462,45 +1472,45 @@ async def test_define_format(setup_test: SetupFixture) -> None:
             Message(
                 role=Role.USER,
                 content=[
-                    Part(root=TextPart(text='hi')),
-                    Part(
-                        root=TextPart(
-                            text=(
-                                'schema: {"properties": {"foo": {"anyOf": [{"type": "integer"}, '
-                                '{"type": "null"}], "default": null, "description": "foo field", '
-                                '"title": "Foo"}, "bar": {"anyOf": [{"type": "string"}, '
-                                '{"type": "null"}], "default": null, "description": "bar field", '
-                                '"title": "Bar"}}, "title": "TestSchema", "type": "object"}'
-                            ),
-                            metadata={'purpose': 'output'},
-                        )
+                    Part.from_text('hi'),
+                    Part.from_text(
+                        (
+                            'schema: {"properties": {"foo": {"anyOf": [{"type": "integer"}, '
+                            '{"type": "null"}], "default": null, "description": "foo field", '
+                            '"title": "Foo"}, "bar": {"anyOf": [{"type": "string"}, '
+                            '{"type": "null"}], "default": null, "description": "bar field", '
+                            '"title": "Bar"}}, "title": "TestSchema", "type": "object"}'
+                        ),
+                        metadata={'purpose': 'output'},
                     ),
                 ],
             ),
         ],
         config={},  # type: ignore[arg-type]
         tools=[],
-        output_format='json',
-        output_schema={
-            'properties': {
-                'foo': {
-                    'anyOf': [{'type': 'integer'}, {'type': 'null'}],
-                    'default': None,
-                    'description': 'foo field',
-                    'title': 'Foo',
+        output=OutputConfig(
+            format='json',
+            json_schema={
+                'properties': {
+                    'foo': {
+                        'anyOf': [{'type': 'integer'}, {'type': 'null'}],
+                        'default': None,
+                        'description': 'foo field',
+                        'title': 'Foo',
+                    },
+                    'bar': {
+                        'anyOf': [{'type': 'string'}, {'type': 'null'}],
+                        'default': None,
+                        'description': 'bar field',
+                        'title': 'Bar',
+                    },
                 },
-                'bar': {
-                    'anyOf': [{'type': 'string'}, {'type': 'null'}],
-                    'default': None,
-                    'description': 'bar field',
-                    'title': 'Bar',
-                },
+                'title': 'TestSchema',
+                'type': 'object',
             },
-            'title': 'TestSchema',
-            'type': 'object',
-        },
-        output_constrained=True,
-        output_content_type='application/banana',
+            constrained=True,
+            content_type='application/banana',
+        ),
     )
 
 
@@ -1509,7 +1519,7 @@ def test_define_model_default_metadata(setup_test: SetupFixture) -> None:
     ai, _, _, *_ = setup_test
 
     async def foo_model_fn(request: ModelRequest, ctx: ActionRunContext) -> ModelResponse:
-        return ModelResponse(message=Message(role=Role.MODEL, content=[Part(root=TextPart(text='banana!'))]))
+        return ModelResponse(message=Message(role=Role.MODEL, content=[Part.from_text('banana!')]))
 
     action = ai.define_model(
         name='foo',
@@ -1530,7 +1540,7 @@ def test_define_model_with_schema(setup_test: SetupFixture) -> None:
         field_b: str = Field(description='b field')
 
     async def foo_model_fn(request: ModelRequest, ctx: ActionRunContext) -> ModelResponse:
-        return ModelResponse(message=Message(role=Role.MODEL, content=[Part(root=TextPart(text='banana!'))]))
+        return ModelResponse(message=Message(role=Role.MODEL, content=[Part.from_text('banana!')]))
 
     action = ai.define_model(
         name='foo',
@@ -1567,18 +1577,22 @@ def test_define_model_with_info(setup_test: SetupFixture) -> None:
     ai, _, _, *_ = setup_test
 
     async def foo_model_fn(request: ModelRequest, ctx: ActionRunContext) -> ModelResponse:
-        return ModelResponse(message=Message(role=Role.MODEL, content=[Part(root=TextPart(text='banana!'))]))
+        return ModelResponse(message=Message(role=Role.MODEL, content=[Part.from_text('banana!')]))
 
     action = ai.define_model(
         name='foo',
         fn=foo_model_fn,
-        info=ModelInfo(label='Foo Bar', supports=Supports(multiturn=True, tools=True)),
+        info=ModelInfo(
+            label='Foo Bar',
+            supports=Supports(multiturn=True, tools=True, system_role=True),
+        ),
     )
     assert action.metadata['model'] == {
         'label': 'Foo Bar',
         'supports': {
             'multiturn': True,
             'tools': True,
+            'systemRole': True,
         },
     }
 
@@ -1655,7 +1669,7 @@ def test_define_batch_evaluator(setup_test: SetupFixture) -> None:
     """Test that the define batch evaluator function works."""
     ai, _, _, *_ = setup_test
 
-    async def my_eval_fn(req: EvalRequest, options: object | None) -> list[EvalFnResponse]:
+    async def my_eval_fn(req: EvalRequest) -> list[EvalFnResponse]:
         eval_responses: list[EvalFnResponse] = []
         for index in range(len(req.dataset)):
             datapoint = req.dataset[index]
@@ -1684,6 +1698,55 @@ def test_define_batch_evaluator(setup_test: SetupFixture) -> None:
         'evaluatorDisplayName': 'Test evaluator',
         'evaluatorIsBilled': False,
     }
+
+
+@pytest.mark.asyncio
+async def test_batch_evaluator_run_reads_options_from_the_request(setup_test: SetupFixture) -> None:
+    """`my_eval(req)` reads options from `req.options`, not a second parameter."""
+    ai, *_ = setup_test
+    seen: list[object] = []
+
+    async def my_eval(req: EvalRequest) -> list[EvalFnResponse]:
+        seen.append(req.options)
+        return [
+            EvalFnResponse(
+                test_case_id=req.dataset[0].test_case_id or '',
+                evaluation=Score(score=True),
+            )
+        ]
+
+    action = ai.define_batch_evaluator(
+        name='my_eval',
+        display_name='Test evaluator',
+        definition='reads options from the request',
+        fn=my_eval,
+    )
+    result = await action.run(
+        EvalRequest(
+            dataset=[BaseDataPoint(input='hi', output='hi', test_case_id='case1')],
+            eval_run_id='run-1',
+            options={'threshold': 0.8},
+        )
+    )
+
+    assert seen == [{'threshold': 0.8}]
+    assert result.response[0].test_case_id == 'case1'
+
+
+def test_batch_evaluator_with_second_parameter_raises_type_error(setup_test: SetupFixture) -> None:
+    """`(req, options)` raises at definition: options live on the request."""
+    ai, *_ = setup_test
+
+    async def my_eval(req: EvalRequest, options: object | None) -> list[EvalFnResponse]:
+        return []
+
+    with pytest.raises(TypeError, match="evaluator 'my_eval' takes one input, but 'options' is a second parameter"):
+        ai.define_batch_evaluator(
+            name='my_eval',
+            display_name='Test evaluator',
+            definition='two params',
+            fn=cast(Any, my_eval),
+        )
 
 
 @pytest.mark.asyncio
@@ -1738,7 +1801,7 @@ async def test_define_async_flow(setup_test: SetupFixture) -> None:
 
 @pytest.mark.asyncio
 async def test_evaluate(setup_test: SetupFixture) -> None:
-    """Test that the evaluate function works."""
+    """ai.evaluate reports a one-score evaluator's evaluation as that Score."""
     ai, _, _, *_ = setup_test
 
     async def my_eval_fn(datapoint: BaseDataPoint, options: object | None) -> EvalFnResponse:
@@ -1764,8 +1827,685 @@ async def test_evaluate(setup_test: SetupFixture) -> None:
     assert isinstance(response, EvalResponse)
     assert len(response.root) == 2
     assert response.root[0].test_case_id == 'case1'
-    assert isinstance(response.root[0].evaluation, Score)
-    assert response.root[0].evaluation.score is True
+    first = response.root[0].evaluation
+    assert isinstance(first, Score)
+    assert first.score is True
     assert response.root[1].test_case_id == 'case2'
-    assert isinstance(response.root[1].evaluation, Score)
-    assert response.root[1].evaluation.score is True
+    second = response.root[1].evaluation
+    assert isinstance(second, Score)
+    assert second.score is True
+
+
+@pytest.mark.asyncio
+async def test_evaluator_records_fail_then_still_runs_the_next_row(
+    setup_test: SetupFixture,
+) -> None:
+    """A row that raises is recorded as FAIL; the next row still runs."""
+    ai, *_ = setup_test
+
+    async def my_eval_fn(datapoint: BaseDataPoint, options: object | None) -> EvalFnResponse:
+        if datapoint.test_case_id == 'case1':
+            raise RuntimeError('row boom')
+        return EvalFnResponse(
+            test_case_id=datapoint.test_case_id or '',
+            evaluation=Score(score=True),
+        )
+
+    ai.define_evaluator(
+        name='my_eval',
+        display_name='Test evaluator',
+        definition='records FAIL then keeps going',
+        fn=my_eval_fn,
+    )
+
+    response = await ai.evaluate(
+        evaluator='my_eval',
+        dataset=[
+            BaseDataPoint(input='hi', output='hi', test_case_id='case1'),
+            BaseDataPoint(input='bye', output='bye', test_case_id='case2'),
+        ],
+    )
+
+    assert isinstance(response, EvalResponse)
+    assert len(response.root) == 2
+    failed = response.root[0].evaluation
+    assert isinstance(failed, Score)
+    assert failed.status == EvalStatusEnum.FAIL
+    assert failed.error is not None
+    assert response.root[1].test_case_id == 'case2'
+    passed = response.root[1].evaluation
+    assert isinstance(passed, Score)
+    assert passed.score is True
+
+
+@pytest.mark.asyncio
+async def test_evaluate_score_list_returns_those_scores(setup_test: SetupFixture) -> None:
+    """ai.evaluate reports an evaluator's list of scores as that list."""
+    ai, _, _, *_ = setup_test
+
+    async def my_eval_fn(datapoint: BaseDataPoint, options: object | None) -> EvalFnResponse:
+        return EvalFnResponse(
+            test_case_id=datapoint.test_case_id or '',
+            evaluation=[
+                Score(id='accuracy', score=0.9),
+                Score(id='fluency', score=0.8),
+            ],
+        )
+
+    ai.define_evaluator(
+        name='list_eval',
+        display_name='List evaluator',
+        definition='Returns two scores per sample',
+        fn=my_eval_fn,
+    )
+
+    response = await ai.evaluate(
+        evaluator='list_eval',
+        dataset=[BaseDataPoint(input='hi', output='hi', test_case_id='case1')],
+    )
+
+    assert isinstance(response, EvalResponse)
+    assert len(response.root) == 1
+    assert response.root[0].test_case_id == 'case1'
+    evaluation = response.root[0].evaluation
+    assert isinstance(evaluation, list)
+    assert [score.id for score in evaluation] == ['accuracy', 'fluency']
+    assert [score.score for score in evaluation] == [0.9, 0.8]
+
+
+@pytest.mark.asyncio
+async def test_evaluate_mixed_rows_keep_score_and_list(setup_test: SetupFixture) -> None:
+    """One row's Score and the next row's score list each come back in the shape the evaluator returned."""
+    ai, *_ = setup_test
+
+    async def my_eval_fn(datapoint: BaseDataPoint, options: object | None) -> EvalFnResponse:
+        if datapoint.test_case_id == 'case1':
+            return EvalFnResponse(test_case_id='case1', evaluation=Score(id='accuracy', score=0.9))
+        return EvalFnResponse(
+            test_case_id=datapoint.test_case_id or '',
+            evaluation=[Score(id='accuracy', score=0.9), Score(id='fluency', score=0.8)],
+        )
+
+    ai.define_evaluator(
+        name='mixed_eval',
+        display_name='Mixed evaluator',
+        definition='Returns a Score or a list depending on the row',
+        fn=my_eval_fn,
+    )
+
+    response = await ai.evaluate(
+        evaluator='mixed_eval',
+        dataset=[
+            BaseDataPoint(input='hi', output='hi', test_case_id='case1'),
+            BaseDataPoint(input='bye', output='bye', test_case_id='case2'),
+        ],
+    )
+
+    assert len(response.root) == 2
+    assert response.root[0].test_case_id == 'case1'
+    one = response.root[0].evaluation
+    assert isinstance(one, Score)
+    assert one.id == 'accuracy'
+    assert one.score == 0.9
+    assert response.root[1].test_case_id == 'case2'
+    many = response.root[1].evaluation
+    assert isinstance(many, list)
+    assert [score.id for score in many] == ['accuracy', 'fluency']
+    assert [score.score for score in many] == [0.9, 0.8]
+
+
+def test_eval_response_score_object_on_load_stays_score() -> None:
+    """A saved row whose evaluation is one score object loads as a Score and writes an object back."""
+    row = EvalFnResponse.model_validate_json('{"testCaseId": "case1", "evaluation": {"id": "accuracy", "score": 0.9}}')
+
+    assert row.test_case_id == 'case1'
+    evaluation = row.evaluation
+    assert isinstance(evaluation, Score)
+    assert evaluation.id == 'accuracy'
+    assert evaluation.score == 0.9
+    assert row.model_dump(by_alias=True, exclude_none=True)['evaluation'] == {'id': 'accuracy', 'score': 0.9}
+
+
+def test_eval_response_score_list_on_load_stays_list() -> None:
+    """A saved row whose evaluation is a list of scores loads as that list and writes a list back."""
+    row = EvalFnResponse.model_validate({
+        'testCaseId': 'case1',
+        'evaluation': [{'id': 'accuracy', 'score': 0.9}, {'id': 'fluency', 'score': 0.8}],
+    })
+
+    assert row.test_case_id == 'case1'
+    evaluation = row.evaluation
+    assert isinstance(evaluation, list)
+    assert [score.id for score in evaluation] == ['accuracy', 'fluency']
+    assert [score.score for score in evaluation] == [0.9, 0.8]
+    assert row.model_dump(by_alias=True, exclude_none=True)['evaluation'] == [
+        {'id': 'accuracy', 'score': 0.9},
+        {'id': 'fluency', 'score': 0.8},
+    ]
+
+
+def test_eval_response_empty_score_list_on_load_stays_empty() -> None:
+    """A saved row whose evaluation is an empty list loads as an empty list."""
+    row = EvalFnResponse.model_validate({'testCaseId': 'case1', 'evaluation': []})
+
+    assert row.test_case_id == 'case1'
+    assert row.evaluation == []
+    assert row.model_dump(by_alias=True, exclude_none=True)['evaluation'] == []
+
+
+def test_eval_response_string_evaluation_raises() -> None:
+    """A saved row whose evaluation is a string raises ValidationError."""
+    with pytest.raises(ValidationError):
+        EvalFnResponse.model_validate({'testCaseId': 'case1', 'evaluation': 'nope'})
+
+
+def test_define_background_model_with_info(setup_test: SetupFixture) -> None:
+    """Test that define_background_model correctly serializes info by alias and excludes None."""
+    ai, _, _, *_ = setup_test
+
+    async def start_fn(request: ModelRequest, ctx: ActionRunContext) -> Operation:
+        return Operation(id='123', done=False)
+
+    async def check_fn(op: Operation, _ctx: ActionRunContext) -> Operation:
+        return op
+
+    action = ai.define_background_model(
+        name='bg_model',
+        start=start_fn,
+        check=check_fn,
+        info=ModelInfo(
+            label='Background Model',
+            supports=Supports(multiturn=True, system_role=True),
+        ),
+    )
+    assert action.start_action.metadata['model'] == {
+        'label': 'Background Model',
+        'supports': {
+            'multiturn': True,
+            'systemRole': True,
+            'longRunning': True,
+        },
+    }
+
+
+def test_background_model_factory_stashes_class_without_registering(setup_test: SetupFixture) -> None:
+    """background_model() keeps the config class on the start action."""
+    from genkit.model import background_model
+
+    ai, _, _, *_ = setup_test
+
+    class BgConfig(BaseModel):
+        duration: int | None = None
+
+    async def start_fn(request: ModelRequest, ctx: ActionRunContext) -> Operation:
+        return Operation(id='123', done=False)
+
+    async def check_fn(op: Operation, _ctx: ActionRunContext) -> Operation:
+        return op
+
+    action = background_model('veo-style', start_fn, check_fn, config_schema=BgConfig)
+    assert action.start_action._config_schema is BgConfig
+    registered = ai.registry._entries.get(ActionKind.BACKGROUND_MODEL, {})
+    assert 'veo-style' not in registered
+
+
+@pytest.mark.asyncio
+async def test_generate_operation_with_model_info_long_running(
+    setup_test: SetupFixture,
+) -> None:
+    """Verify generate_operation succeeds for a define_background_model."""
+    ai, _, _, *_ = setup_test
+
+    async def start(_request: ModelRequest, _ctx: ActionRunContext) -> Operation:
+        return Operation(id='op123', done=False)
+
+    async def check(op: Operation, _ctx: ActionRunContext) -> Operation:
+        return op
+
+    ai.define_background_model(name='lr_model', start=start, check=check)
+
+    op = await ai.generate_operation(model='lr_model', prompt='test')
+    assert op is not None
+
+
+# ModelResponse.request is the request Genkit sent for that turn. It carries
+# every field the caller configured -- messages, docs, config, tools,
+# tool_choice and output -- and it is populated the same way whether the turn
+# succeeded, failed, or stopped early. These pin that contract on the exits
+# where no model call completed, which are the ones most likely to regress.
+
+_ECHO_CONFIG = {'temperature': 0.5}
+
+
+def _echo_request_kwargs() -> dict[str, Any]:
+    return {
+        'docs': [Document(content=[Part.from_text('doc content 1')])],
+        'config': dict(_ECHO_CONFIG),
+        'tool_choice': 'required',
+        'output_format': 'json',
+    }
+
+
+def _assert_request_fully_echoed(response: ModelResponse) -> None:
+    """All six ModelRequest fields survive, not just messages."""
+    request = response.request
+    assert request is not None
+    assert request.messages
+    assert request.docs is not None, 'docs dropped from echoed request'
+    assert request.config == _ECHO_CONFIG, 'config dropped from echoed request'
+    assert request.tools, 'tools dropped from echoed request'
+    assert request.tool_choice == 'required', 'tool_choice dropped from echoed request'
+    assert request.output is not None
+    assert request.output.format == 'json', 'output dropped from echoed request'
+
+
+def _define_echo_request_tool(ai: Genkit) -> None:
+    class ToolInput(BaseModel):
+        value: int | None = Field(None, description='value field')
+
+    @ai.tool(name='test_tool')
+    async def test_tool(input: ToolInput) -> int:
+        """The tool."""
+        return (input.value or 0) + 7
+
+
+def _tool_call_message(name: str) -> Message:
+    return Message(
+        role=Role.MODEL,
+        content=[Part(tool_request=ToolRequest(input={'value': 5}, name=name, ref='123'))],
+    )
+
+
+@pytest.mark.asyncio
+async def test_generate_echoes_full_request_when_model_raises(setup_test: SetupFixture) -> None:
+    """The model call failed, but response.request still holds what you configured."""
+    ai, _, pm = setup_test
+    _define_echo_request_tool(ai)
+
+    def boom(request: ModelRequest) -> ModelResponse:
+        raise ValueError('model exploded')
+
+    pm.response_cb = boom
+
+    response = await ai.generate(
+        model='scriptedModel',
+        prompt='hi',
+        tools=['test_tool'],
+        **_echo_request_kwargs(),
+    )
+
+    assert response.finish_reason == FinishReason.FAILED
+    _assert_request_fully_echoed(response)
+
+
+@pytest.mark.asyncio
+async def test_generate_echoes_full_request_when_hook_raises(setup_test: SetupFixture) -> None:
+    """A middleware that raises still hands back the request your options described."""
+    ai, _, pm = setup_test
+    _define_echo_request_tool(ai)
+
+    @ai.middleware(name='raising_mw')
+    class RaisingMiddleware(BaseMiddleware):
+        async def wrap_generate(
+            self,
+            params: Any,
+            ctx: GenerateMiddlewareContext,
+            next_fn: Callable[[Any, GenerateMiddlewareContext], Awaitable[ModelResponse]],
+        ) -> ModelResponse:
+            raise ValueError('hook exploded')
+
+    response = await ai.generate(
+        model='scriptedModel',
+        prompt='hi',
+        tools=['test_tool'],
+        use=[MiddlewareRef(name='raising_mw')],
+        **_echo_request_kwargs(),
+    )
+
+    assert response.finish_reason == FinishReason.FAILED
+    _assert_request_fully_echoed(response)
+
+
+@pytest.mark.asyncio
+async def test_generate_echoes_full_request_when_max_turns_exceeded(
+    setup_test: SetupFixture,
+) -> None:
+    """Hitting the tool-call cap still reports the request from the turn that ran."""
+    ai, _, pm = setup_test
+    _define_echo_request_tool(ai)
+
+    pm.response_cb = lambda request: ModelResponse(
+        finish_reason=FinishReason.STOP,
+        message=_tool_call_message('test_tool'),
+    )
+
+    response = await ai.generate(
+        model='scriptedModel',
+        prompt='hi',
+        tools=['test_tool'],
+        max_turns=1,
+        **_echo_request_kwargs(),
+    )
+
+    assert response.finish_reason == FinishReason.ABORTED
+    _assert_request_fully_echoed(response)
+
+
+@pytest.mark.asyncio
+async def test_generate_echoes_full_request_when_tool_missing(setup_test: SetupFixture) -> None:
+    """The model asked for a tool that does not exist; your request is still reported."""
+    ai, _, pm = setup_test
+    _define_echo_request_tool(ai)
+
+    pm.responses.append(
+        ModelResponse(
+            finish_reason=FinishReason.STOP,
+            message=_tool_call_message('nonexistent_tool'),
+        )
+    )
+
+    response = await ai.generate(
+        model='scriptedModel',
+        prompt='hi',
+        tools=['test_tool'],
+        **_echo_request_kwargs(),
+    )
+
+    assert response.finish_reason == FinishReason.FAILED
+    _assert_request_fully_echoed(response)
+
+
+@pytest.mark.asyncio
+async def test_generate_echoes_full_request_across_interrupt_and_resume(
+    setup_test: SetupFixture,
+) -> None:
+    """An interrupt and the resume that follows both report the full request."""
+    ai, _, pm = setup_test
+
+    class ToolInput(BaseModel):
+        value: int | None = Field(None, description='value field')
+
+    @ai.tool(name='test_interrupt')
+    async def test_interrupt(input: ToolInput) -> None:
+        """The interrupt."""
+        raise Interrupt({'banana': 'yes please'})
+
+    pm.responses.append(
+        ModelResponse(
+            finish_reason=FinishReason.STOP,
+            message=_tool_call_message('test_interrupt'),
+        )
+    )
+    pm.responses.append(
+        ModelResponse(
+            finish_reason=FinishReason.STOP,
+            message=Message(role=Role.MODEL, content=[Part.from_text('tool called')]),
+        )
+    )
+
+    interrupted = await ai.generate(
+        model='scriptedModel',
+        prompt='hi',
+        tools=['test_interrupt'],
+        **_echo_request_kwargs(),
+    )
+    assert interrupted.finish_reason == FinishReason.INTERRUPTED
+    _assert_request_fully_echoed(interrupted)
+
+    resumed = await ai.generate(
+        model='scriptedModel',
+        messages=interrupted.messages,
+        resume_respond=[interrupted.interrupts[0].respond({'bar': 2})],
+        tools=['test_interrupt'],
+        **_echo_request_kwargs(),
+    )
+    _assert_request_fully_echoed(resumed)
+
+
+@pytest.mark.asyncio
+async def test_generate_echoes_full_request_when_restart_interrupts_again(
+    setup_test: SetupFixture,
+) -> None:
+    """Restarting an interrupted tool that interrupts again still reports the request.
+
+    No model call happens on this turn, so there is nothing for the model to
+    echo back. You get the request that turn would have sent anyway.
+    """
+    ai, _, pm = setup_test
+
+    class ToolInput(BaseModel):
+        value: int | None = Field(None, description='value field')
+
+    @ai.tool(name='test_interrupt')
+    async def test_interrupt(input: ToolInput) -> None:
+        """Always interrupts."""
+        raise Interrupt({'banana': 'yes please'})
+
+    pm.responses.append(
+        ModelResponse(
+            finish_reason=FinishReason.STOP,
+            message=_tool_call_message('test_interrupt'),
+        )
+    )
+
+    interrupted = await ai.generate(
+        model='scriptedModel',
+        prompt='hi',
+        tools=['test_interrupt'],
+        **_echo_request_kwargs(),
+    )
+    _assert_request_fully_echoed(interrupted)
+
+    again = await ai.generate(
+        model='scriptedModel',
+        messages=interrupted.messages,
+        resume_restart=interrupted.interrupts[0].restart(),
+        tools=['test_interrupt'],
+        **_echo_request_kwargs(),
+    )
+
+    assert again.finish_reason == FinishReason.INTERRUPTED
+    _assert_request_fully_echoed(again)
+    # The restart re-ran the tool, not the model, so the caller is back where
+    # they were: same history to resend, same interrupt to answer.
+    assert pm.request_count == 1
+    assert again.messages == interrupted.messages
+    assert len(again.interrupts) == 1
+
+    pm.responses.append(
+        ModelResponse(
+            finish_reason=FinishReason.STOP,
+            message=Message(role=Role.MODEL, content=[Part.from_text('all done')]),
+        )
+    )
+    answered = await ai.generate(
+        model='scriptedModel',
+        messages=again.messages,
+        resume_respond=[again.interrupts[0].respond({'ok': True})],
+        tools=['test_interrupt'],
+        **_echo_request_kwargs(),
+    )
+
+    assert answered.finish_reason == FinishReason.STOP
+    assert answered.text == 'all done'
+    _assert_request_fully_echoed(answered)
+
+
+@pytest.mark.asyncio
+async def test_generate_restart_can_pause_any_number_of_times(
+    setup_test: SetupFixture,
+) -> None:
+    """A restart may pause as many times as the tool needs.
+
+    Each pause hands back the same shape, so you can keep restarting, answer
+    the interrupt, or give up. The history you resend and the request you read
+    back do not drift between rounds.
+    """
+    ai, _, pm = setup_test
+
+    class ToolInput(BaseModel):
+        value: int | None = Field(None, description='value field')
+
+    attempts = {'n': 0}
+
+    @ai.tool(name='gatekeeper')
+    async def gatekeeper(input: ToolInput) -> str:
+        """Interrupts three times, then allows the call."""
+        attempts['n'] += 1
+        if attempts['n'] <= 3:
+            raise Interrupt({'attempt': attempts['n']})
+        return 'finally allowed'
+
+    pm.responses.append(
+        ModelResponse(
+            finish_reason=FinishReason.STOP,
+            message=_tool_call_message('gatekeeper'),
+        )
+    )
+    pm.responses.append(
+        ModelResponse(
+            finish_reason=FinishReason.STOP,
+            message=Message(role=Role.MODEL, content=[Part.from_text('all done')]),
+        )
+    )
+
+    response = await ai.generate(
+        model='scriptedModel',
+        prompt='hi',
+        tools=['gatekeeper'],
+        **_echo_request_kwargs(),
+    )
+    history = response.messages
+
+    # Restarts two and three have to behave exactly like the first one.
+    for attempt in range(2, 4):
+        response = await ai.generate(
+            model='scriptedModel',
+            messages=response.messages,
+            resume_restart=response.interrupts[0].restart(),
+            tools=['gatekeeper'],
+            **_echo_request_kwargs(),
+        )
+        assert response.finish_reason == FinishReason.INTERRUPTED
+        _assert_request_fully_echoed(response)
+        # Nothing accumulates: the history keeps its shape and the model is
+        # never re-invoked. The interrupt payload is replaced, not appended
+        # to, so a tool reporting fresh state does not grow the message.
+        assert [m.role for m in response.messages] == [m.role for m in history]
+        assert len(response.messages[-1].content) == 1
+        assert pm.request_count == 1
+        assert response.interrupts[0].metadata is not None
+        assert response.interrupts[0].metadata['interrupt'] == {'attempt': attempt}
+
+    # The fourth restart succeeds, so the run closes normally.
+    answered = await ai.generate(
+        model='scriptedModel',
+        messages=response.messages,
+        resume_restart=response.interrupts[0].restart(),
+        tools=['gatekeeper'],
+        **_echo_request_kwargs(),
+    )
+
+    assert answered.finish_reason == FinishReason.STOP
+    assert answered.text == 'all done'
+    assert [m.role for m in answered.messages] == [Role.USER, Role.MODEL, Role.TOOL, Role.MODEL]
+    _assert_request_fully_echoed(answered)
+
+
+@pytest.mark.asyncio
+async def test_generate_resolved_sibling_survives_repeated_interrupts(
+    setup_test: SetupFixture,
+) -> None:
+    """A tool that already ran is never run again while a sibling stays paused.
+
+    When one tool in a turn finishes and another interrupts, the finished
+    tool's output is carried forward rather than recomputed. A tool with side
+    effects -- a charge, an email, a write -- runs exactly once no matter how
+    many times the other tool is restarted.
+    """
+    ai, _, pm = setup_test
+
+    class ToolInput(BaseModel):
+        value: int | None = Field(None, description='value field')
+
+    calls = {'charge': 0, 'approve': 0}
+
+    @ai.tool(name='charge_card')
+    async def charge_card(input: ToolInput) -> str:
+        """Succeeds on the first turn. Charging twice would be a real bug."""
+        calls['charge'] += 1
+        return f'charged#{calls["charge"]}'
+
+    @ai.tool(name='approve')
+    async def approve(input: ToolInput) -> str:
+        """Interrupts three times, then approves."""
+        calls['approve'] += 1
+        if calls['approve'] <= 3:
+            raise Interrupt({'need': 'human', 'attempt': calls['approve']})
+        return 'approved'
+
+    pm.responses.append(
+        ModelResponse(
+            finish_reason=FinishReason.STOP,
+            message=Message(
+                role=Role.MODEL,
+                content=[
+                    Part(tool_request=ToolRequest(input={'value': 1}, name='charge_card', ref='c1')),
+                    Part(tool_request=ToolRequest(input={'value': 2}, name='approve', ref='a1')),
+                ],
+            ),
+        )
+    )
+    pm.responses.append(
+        ModelResponse(
+            finish_reason=FinishReason.STOP,
+            message=Message(role=Role.MODEL, content=[Part.from_text('all settled')]),
+        )
+    )
+
+    response = await ai.generate(
+        model='scriptedModel',
+        prompt='pay and approve',
+        tools=['charge_card', 'approve'],
+    )
+    assert response.finish_reason == FinishReason.INTERRUPTED
+    assert calls['charge'] == 1
+
+    def charge_part(resp: ModelResponse) -> Part:
+        return next(
+            p for p in resp.messages[-1].content if p.tool_request is not None and p.tool_request.name == 'charge_card'
+        )
+
+    # The completed sibling rides along as a stash, not as a re-run.
+    assert charge_part(response).metadata == {'pendingOutput': 'charged#1'}
+    sizes = set()
+
+    for attempt in range(2, 5):
+        response = await ai.generate(
+            model='scriptedModel',
+            messages=response.messages,
+            resume_restart=response.interrupts[0].restart(),
+            tools=['charge_card', 'approve'],
+        )
+        if attempt < 5 and response.interrupts:
+            assert response.finish_reason == FinishReason.INTERRUPTED
+            assert response.interrupts[0].metadata is not None
+            assert response.interrupts[0].metadata['interrupt'] == {
+                'need': 'human',
+                'attempt': attempt,
+            }
+            stash = charge_part(response).metadata or {}
+            assert stash['pendingOutput'] == 'charged#1'
+            # The stash must not nest itself deeper on every round.
+            sizes.add(len(json.dumps(stash, sort_keys=True, default=str)))
+        assert calls['charge'] == 1
+
+    # Bounded: the stash settles on one shape instead of growing per round.
+    assert len(sizes) == 1, f'pending stash grew across rounds: {sizes}'
+
+    assert response.finish_reason == FinishReason.STOP
+    assert response.text == 'all settled'
+    assert calls['charge'] == 1, 'a resolved tool was re-run across the interrupts'
+    tool_msg = next(m for m in response.messages if m.role == Role.TOOL)
+    outputs = {p.tool_response.name: p.tool_response.output for p in tool_msg.content if p.tool_response}
+    assert outputs == {'charge_card': 'charged#1', 'approve': 'approved'}

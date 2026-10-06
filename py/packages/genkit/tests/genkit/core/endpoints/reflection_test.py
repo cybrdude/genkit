@@ -49,9 +49,11 @@ from pydantic import BaseModel, Field
 from genkit import Genkit
 from genkit._core._action import ActionKind
 from genkit._core._middleware import BaseMiddleware
+from genkit._core._model import ModelConfig
 from genkit._core._reflection import create_reflection_asgi_app
 from genkit._core._registry import Registry
 from genkit._core._typing import ActionMetadata
+from genkit.model import model_ref
 
 
 @pytest.fixture
@@ -178,6 +180,7 @@ async def test_run_action_standard(asgi_client: AsyncClient, mock_registry: Magi
         on_trace_start=ANY,
         on_chunk=None,
         telemetry_labels=None,
+        init=None,
     )
 
 
@@ -212,6 +215,7 @@ async def test_run_action_with_context(asgi_client: AsyncClient, mock_registry: 
         on_trace_start=ANY,
         on_chunk=None,
         telemetry_labels=None,
+        init=None,
     )
 
 
@@ -416,3 +420,62 @@ async def test_values_middleware_empty_config_schema_for_no_op() -> None:
         }
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_values_default_model_ref_is_name() -> None:
+    """A stored ModelRef lists as its wire name so the Dev UI can JSON it."""
+    registry = Registry()
+    registry.register_value(
+        'defaultModel',
+        'defaultModel',
+        model_ref(
+            'echoModel',
+            config_schema=ModelConfig,
+            version='001',
+            config=ModelConfig(temperature=0.7),
+        ),
+    )
+    client = await _registry_asgi_client(registry)
+    try:
+        response = await client.get('/api/values?type=defaultModel')
+        assert response.status_code == 200
+        assert response.json() == {'defaultModel': 'echoModel'}
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_values_lists_a2ui_catalog() -> None:
+    """The Developer UI lists registered A2UI catalogs at /api/values?type=a2ui-catalog."""
+    registry = Registry()
+    catalog = {
+        'id': 'https://example.com/catalogs/banner.json',
+        'components': [{'name': 'Banner', 'description': 'A banner.', 'props': 'title: string.'}],
+    }
+    registry.register_value('a2ui-catalog', catalog['id'], catalog)
+    client = await _registry_asgi_client(registry)
+    try:
+        response = await client.get('/api/values?type=a2ui-catalog')
+        assert response.status_code == 200
+        assert response.json() == {catalog['id']: catalog}
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_no_cors_headers_returned(asgi_client: AsyncClient) -> None:
+    """Test that the reflection server does not return CORS headers, matching JS/Go."""
+    response = await asgi_client.get('/api/__health', headers={'Origin': 'https://evil.example'})
+    assert response.status_code == 200
+    assert 'access-control-allow-origin' not in response.headers
+
+    preflight = await asgi_client.options(
+        '/api/runAction',
+        headers={
+            'Origin': 'https://evil.example',
+            'Access-Control-Request-Method': 'POST',
+            'Access-Control-Request-Headers': 'content-type',
+        },
+    )
+    assert 'access-control-allow-origin' not in preflight.headers

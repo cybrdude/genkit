@@ -1,18 +1,54 @@
 # Types
 
-Types exported from genkit, genkit.model, genkit.embedder, genkit.plugin_api, and genkit.evaluator.
+Types exported from genkit, genkit.model, genkit.embedder, genkit.plugin_api, genkit.evaluator, genkit.telemetry, and genkit.exp.agent.
 
 ## genkit
 
 ::: genkit.Genkit
 
-::: genkit.Plugin
+::: genkit.Message
 
-::: genkit.Action
+::: genkit.Role
+
+::: genkit.Part
+
+::: genkit.Media
+
+::: genkit.Document
+
+::: genkit.ToolChoice
+
+::: genkit.ModelResponse
+
+::: genkit.ModelResponseChunk
+
+::: genkit.ModelStreamResponse
+
+::: genkit.StreamResponse
+
+::: genkit.FinishReason
+
+::: genkit.Embedding
+
+::: genkit.BaseDataPoint
+
+::: genkit.EvalResponse
+
+::: genkit.Operation
+
+::: genkit.tool
+
+::: genkit.Tool
+
+::: genkit.ToolRunContext
+
+::: genkit.Interrupt
+
+::: genkit.response
+
+::: genkit.MultipartToolResponse
 
 ::: genkit.Flow
-
-::: genkit.ActionKind
 
 ::: genkit.ActionRunContext
 
@@ -20,105 +56,37 @@ Types exported from genkit, genkit.model, genkit.embedder, genkit.plugin_api, an
 
 ::: genkit.PromptGenerateOptions
 
-::: genkit.ResumeOptions
-
-::: genkit.ToolRunContext
-
-::: genkit.StreamResponse
-
-::: genkit.ModelStreamResponse
-
 ::: genkit.GenkitError
 
 ::: genkit.PublicError
 
-::: genkit.Interrupt
+::: genkit.RuntimeErrorReason
 
-::: genkit.Message
+::: genkit.ContextProvider
 
-::: genkit.Part
+::: genkit.RequestData
 
-::: genkit.TextPart
+::: genkit.FormatDef
 
-::: genkit.MediaPart
+::: genkit.FormatterConfig
 
-::: genkit.Media
-
-::: genkit.CustomPart
-
-::: genkit.ReasoningPart
-
-::: genkit.Role
-
-::: genkit.Metadata
-
-::: genkit.ToolRequest
-
-::: genkit.ToolRequestPart
-
-::: genkit.ToolResponse
-
-::: genkit.ToolResponsePart
-
-::: genkit.ToolDefinition
-
-::: genkit.ToolChoice
-
-::: genkit.Document
-
-::: genkit.DocumentPart
-
-::: genkit.EmbedderRef
-
-::: genkit.EmbedderOptions
-
-::: genkit.Embedding
-
-::: genkit.EmbedRequest
-
-::: genkit.EmbedResponse
-
-::: genkit.ModelRequest
-
-::: genkit.ModelResponse
-
-::: genkit.ModelResponseChunk
-
-::: genkit.ModelConfig
-
-::: genkit.ModelInfo
-
-::: genkit.ModelUsage
-
-::: genkit.Constrained
-
-::: genkit.Stage
-
-::: genkit.Supports
-
-::: genkit.FinishReason
+::: genkit.DynamicActionProvider
 
 ## genkit.model
 
 ::: genkit.model.BackgroundAction
 
+::: genkit.model.GenerateActionOptions
+
 ::: genkit.model.ModelRequest
 
-::: genkit.model.ModelResponse
-
-::: genkit.model.ModelResponseChunk
+::: genkit.model.OutputConfig
 
 ::: genkit.model.ModelUsage
 
 ::: genkit.model.Candidate
 
-::: genkit.model.FinishReason
-
-::: genkit.model.GenerateActionOptions
-
-::: genkit.model.Error
-
-::: genkit.model.Operation
+::: genkit.model.OperationError
 
 ::: genkit.model.ToolRequest
 
@@ -138,21 +106,17 @@ Types exported from genkit, genkit.model, genkit.embedder, genkit.plugin_api, an
 
 ::: genkit.model.ModelConfig
 
-::: genkit.model.Message
-
 ## genkit.embedder
 
 ::: genkit.embedder.EmbedRequest
 
 ::: genkit.embedder.EmbedResponse
 
-::: genkit.embedder.Embedding
-
 ::: genkit.embedder.EmbedderRef
 
 ::: genkit.embedder.EmbedderSupports
 
-::: genkit.embedder.EmbedderOptions
+::: genkit.embedder.EmbedderInfo
 
 ## genkit.plugin_api
 
@@ -164,33 +128,11 @@ Types exported from genkit, genkit.model, genkit.embedder, genkit.plugin_api, an
 
 ::: genkit.plugin_api.ActionKind
 
-::: genkit.plugin_api.ActionRunContext
-
-::: genkit.plugin_api.StatusCodes
-
 ::: genkit.plugin_api.StatusName
-
-::: genkit.plugin_api.GenkitError
-
-::: genkit.plugin_api.AdjustingTraceExporter
-
-::: genkit.plugin_api.RedactedSpan
-
-::: genkit.plugin_api.ModelRef
-
-::: genkit.plugin_api.EmbedderRef
-
-::: genkit.plugin_api.EvaluatorRef
-
-::: genkit.plugin_api.ContextProvider
-
-::: genkit.plugin_api.RequestData
 
 ## genkit.evaluator
 
 ::: genkit.evaluator.EvalRequest
-
-::: genkit.evaluator.EvalResponse
 
 ::: genkit.evaluator.EvalFnResponse
 
@@ -198,10 +140,36 @@ Types exported from genkit, genkit.model, genkit.embedder, genkit.plugin_api, an
 
 ::: genkit.evaluator.Details
 
-::: genkit.evaluator.BaseEvalDataPoint
-
-::: genkit.evaluator.BaseDataPoint
-
 ::: genkit.evaluator.EvalStatusEnum
 
 ::: genkit.evaluator.EvaluatorRef
+
+## genkit.telemetry
+
+::: genkit.telemetry.run_in_new_span
+
+::: genkit.telemetry.SpanMetadata
+
+## genkit.exp.agent
+
+::: genkit.exp.agent.apply_json_patch
+
+::: genkit.exp.agent.diff_json
+
+::: genkit.exp.agent.JsonPatchOp
+
+::: genkit.exp.agent.JsonPatchOperation
+
+::: genkit.exp.agent.StateT
+
+::: genkit.exp.agent.TERMINAL_STATUSES
+
+::: genkit.exp.agent.SaveFn
+
+::: genkit.exp.agent.apply_save
+
+::: genkit.exp.agent.iterate_statuses
+
+::: genkit.exp.agent.require_one_selector
+
+::: genkit.exp.agent.session_id_of

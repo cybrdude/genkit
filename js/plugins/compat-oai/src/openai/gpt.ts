@@ -255,6 +255,36 @@ const gpt5_1 = openAIModelRef({
   name: 'gpt-5.1',
   info: GPT_5_MODEL_INFO,
 });
+const gpt5_2 = openAIModelRef({
+  name: 'gpt-5.2',
+  info: GPT_5_MODEL_INFO,
+});
+const gpt5_4 = openAIModelRef({
+  name: 'gpt-5.4',
+  info: GPT_5_MODEL_INFO,
+});
+const gpt5_4Mini = openAIModelRef({
+  name: 'gpt-5.4-mini',
+  info: GPT_5_MODEL_INFO,
+});
+const gpt5_4Nano = openAIModelRef({
+  name: 'gpt-5.4-nano',
+  info: GPT_5_MODEL_INFO,
+});
+const gpt5_5 = openAIModelRef({
+  name: 'gpt-5.5',
+  info: GPT_5_MODEL_INFO,
+});
+// Chat Completions rejects function tools for this model.
+const gpt6Astra = openAIModelRef({
+  name: 'gpt-6-astra',
+  info: {
+    supports: {
+      ...GPT_5_MODEL_INFO.supports,
+      tools: false,
+    },
+  },
+});
 
 export const SUPPORTED_GPT_MODELS = {
   'gpt-4.5': gpt45,
@@ -287,4 +317,10 @@ export const SUPPORTED_GPT_MODELS = {
   'gpt-5-nano': gpt5Nano,
   'gpt-5-chat-latest': gpt5ChatLatest,
   'gpt-5.1': gpt5_1,
+  'gpt-5.2': gpt5_2,
+  'gpt-5.4': gpt5_4,
+  'gpt-5.4-mini': gpt5_4Mini,
+  'gpt-5.4-nano': gpt5_4Nano,
+  'gpt-5.5': gpt5_5,
+  'gpt-6-astra': gpt6Astra,
 } as const;

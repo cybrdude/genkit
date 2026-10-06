@@ -37,6 +37,7 @@ import (
 	"github.com/firebase/genkit/go/ai"
 	aix "github.com/firebase/genkit/go/ai/exp"
 	"github.com/firebase/genkit/go/ai/exp/tool"
+	"github.com/firebase/genkit/go/core/status"
 	"github.com/firebase/genkit/go/genkit"
 	genkitx "github.com/firebase/genkit/go/genkit/exp"
 )
@@ -44,8 +45,8 @@ import (
 // TransferInput and TransferOutput are the tool's contract: the JSON
 // schemas inferred from these field names are what the model sees.
 type TransferInput struct {
-	ToAccount string  `json:"toAccount" jsonschema:"description=destination account ID"`
-	Amount    float64 `json:"amount" jsonschema:"description=amount in dollars (e.g. 50.00 for $50)"`
+	ToAccount string  `json:"toAccount" jsonschema_description:"destination account ID"`
+	Amount    float64 `json:"amount" jsonschema_description:"amount in dollars (e.g. 50.00 for $50)"`
 }
 
 type TransferOutput struct {
@@ -71,8 +72,8 @@ type Confirmation struct {
 }
 
 // accountBalance is the demo's single mutable "account". It is process
-// state, not session state, so it is shared across conversations and reset
-// on restart — fine for illustrating the interrupt flow.
+// state, not session state, so it is shared across conversations and reset on
+// restart, which is fine for illustrating the interrupt flow.
 var accountBalance = 150.00
 
 // defineBankerAgent registers the transferMoney tool and a prompt-backed
@@ -83,11 +84,21 @@ func defineBankerAgent(g *genkit.Genkit) *aix.Agent[any] {
 
 	// transferMoney is an interruptible tool: rather than always returning a
 	// result, it can pause (tool.Interrupt) to get the user's approval. Its
-	// third parameter (*Confirmation) is the resume payload — nil on the
-	// first call, populated when the client resumes.
+	// third parameter (*Confirmation) is the resume payload: nil on the first
+	// call, populated when the client resumes.
 	genkitx.DefineInterruptibleTool(g, "transferMoney",
 		"Transfers money to another account. Use when the user wants to send money.",
 		func(ctx context.Context, input TransferInput, confirm *Confirmation) (*TransferOutput, error) {
+			if input.Amount <= 0 {
+				// A tool error fails the turn. Classify it anyway: the
+				// runtime wraps it as ai.ErrToolFailed with the cause
+				// preserved, so server-side code can still branch with
+				// errors.Is(err, status.ErrInvalidArgument) instead of
+				// matching message text.
+				return nil, status.Errorf(status.ErrInvalidArgument,
+					"transfer amount must be positive, got $%.2f", input.Amount)
+			}
+
 			if confirm != nil {
 				if !confirm.Approved {
 					return &TransferOutput{Status: "cancelled", Message: "Transfer cancelled by user.", NewBalance: accountBalance}, nil
@@ -124,17 +135,16 @@ func defineBankerAgent(g *genkit.Genkit) *aix.Agent[any] {
 			}, nil
 		})
 
-	return genkitx.DefinePromptAgent[any](g, name,
-		aix.WithSessionStore(mustStore(name)),
+	return genkitx.DefinePromptAgent(g, name,
+		aix.WithSessionStore(mustStore[any](name)),
 		aix.WithDescription[any]("Money transfer assistant (interruptible tool + human approval)"),
 	)
 }
 
 // handleTransferInterrupt is the banker's InterruptHandler. It reads the
 // typed interrupt payload, asks the user through the Prompter, and returns
-// a restart part (tool.Resume) carrying their decision. Returning a resume
-// part — instead of touching the connection — is what keeps the handler
-// decoupled from the CLI's streaming loop.
+// a restart part (tool.Resume) carrying their decision. Returning a part rather
+// than touching the connection keeps the handler out of the streaming loop.
 func handleTransferInterrupt(p *Prompter, part *ai.Part) (*ai.Part, error) {
 	meta, ok := tool.InterruptAs[TransferInterrupt](part)
 	if !ok {

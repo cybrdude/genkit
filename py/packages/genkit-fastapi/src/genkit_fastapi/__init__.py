@@ -26,19 +26,26 @@ Example:
     ```python
     from fastapi import FastAPI
     from genkit import Genkit
-    from genkit_fastapi import genkit_fastapi_handler
+    from genkit_fastapi import serve_flow
     from genkit_google_genai import GoogleAI
 
-    ai = Genkit(plugins=[GoogleAI()])
+    ai = Genkit(plugins=[GoogleAI()], model=GoogleAI.gemini_model('gemini-flash-latest'))
     app = FastAPI()
 
 
-    @app.post('/chat', response_model=None)
-    @genkit_fastapi_handler(ai)
     @ai.flow()
     async def chat_flow(prompt: str) -> str:
-        response = await ai.generate(prompt=prompt)
-        return response.text
+        res = await ai.generate(prompt=prompt)
+        return res.text
+
+
+    # Mount flow endpoint at POST /api/chat_flow
+    app.include_router(serve_flow(chat_flow), prefix='/api')
+
+    # serve_agent(agent) mounts the same JSON protocol for an agent, plus
+    # /getSnapshot and /abort when session storage is enabled.
+
+    # For a custom route, decorate with @genkit_fastapi_handler(ai) over @ai.flow().
     ```
 
 Running:
@@ -51,7 +58,7 @@ Running:
     ```
 """
 
-from .handler import genkit_fastapi_handler
+from .handler import genkit_fastapi_handler, handle_genkit_request, serve_agent, serve_flow
 
 
 def package_name() -> str:
@@ -59,4 +66,10 @@ def package_name() -> str:
     return 'genkit_fastapi'
 
 
-__all__ = ['package_name', 'genkit_fastapi_handler']
+__all__ = [
+    'genkit_fastapi_handler',
+    'handle_genkit_request',
+    'package_name',
+    'serve_agent',
+    'serve_flow',
+]
