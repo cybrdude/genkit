@@ -42,6 +42,17 @@ const MAX_PAYLOAD_SIZE = 30000000;
  * passing an explicit host.
  */
 const DEFAULT_HOST = '127.0.0.1';
+
+/** True when `host` is a loopback address, i.e. only reachable locally. */
+function isLoopbackHost(host: string): boolean {
+  return (
+    host === '127.0.0.1' ||
+    host === 'localhost' ||
+    host === '::1' ||
+    host === '[::1]'
+  );
+}
+
 const UI_ASSETS_GCS_BUCKET = `https://storage.googleapis.com/genkit-assets`;
 const UI_ASSETS_ZIP_FILE_NAME = `${toolsPackage.version}.zip`;
 const UI_ASSETS_ZIP_GCS_PATH = `${UI_ASSETS_GCS_BUCKET}/${UI_ASSETS_ZIP_FILE_NAME}`;
@@ -365,8 +376,11 @@ export function startServer(
   app.use(
     API_BASE_PATH,
     trpcExpress.createExpressMiddleware({
-      router: TOOLS_SERVER_ROUTER(manager),
+      router: TOOLS_SERVER_ROUTER(manager, {
+        boundToLoopback: isLoopbackHost(host),
+      }),
       maxBodySize: MAX_PAYLOAD_SIZE,
+      createContext: ({ req }) => ({ req }),
     })
   );
 
