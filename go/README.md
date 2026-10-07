@@ -95,7 +95,7 @@ Every sample below runs on its own with `go run .`, and its package comment expl
 | [basic‑media](samples/basic-media) | Reading, drawing, and redrawing pictures, plus generating video with a polled background model |
 | [basic‑prompts](samples/basic-prompts) | Prompt templates with Handlebars and `.prompt` files, shared partials and helpers, and prompts embedded in the binary |
 | [basic‑prompt‑content](samples/basic-prompt-content/main.go) | Prompt content computed from your data, with media and retrieved docs |
-| [basic‑tools](samples/basic-tools/main.go) | A slow tool whose answer is more than one value, returned as a multipart response |
+| [basic‑tools](samples/basic-tools/main.go) | A slow tool that streams progress and attaches a chart to its answer |
 | [basic‑tools‑exp](samples/basic-tools-exp/main.go) | The same program on the in-preview tools API, so the diff between the two is the API |
 | [basic‑agents](samples/basic-agents) | Multi-turn agents (inline, prompt-file, and custom-loop) with snapshots and background detach |
 | [basic‑agents‑server](samples/basic-agents-server/main.go) | Serving store-backed and stateless agents over HTTP |
@@ -720,18 +720,38 @@ response, _ := genkit.Generate(ctx, g,
 fmt.Println(response.Text())
 ```
 
-A tool error fails the whole generation rather than being reported to the model, so a miss the model could work around (no such city, no rows matched) belongs in the result rather than in an `error`.
-
-`genkit.DefineMultipartTool` is for a result that is more than one value. It returns an `ai.MultipartToolResponse` instead: `Output` is what a plain tool would have returned, and `Content` carries parts that are not values, such as an image or a document. Those parts reach the model and the client both, and must be media or data parts.
+A tool error fails the whole generation. For an error the model can work around, return `tool.Fail` from the `ai/tool` package instead: the error answers the call as `{"error": "..."}` and the loop continues, so the model can correct its input. Any other error still stops the generation:
 
 ```go
-chartTool := genkit.DefineMultipartTool(g, "chartWeather",
-    "Charts a location's temperatures for the last week",
-    func(ctx *ai.ToolContext, input WeatherInput) (*ai.MultipartToolResponse, error) {
-        return &ai.MultipartToolResponse{
-            Output:  Trend{Low: 61, High: 78},
-            Content: []*ai.Part{ai.NewMediaPart("image/png", chartDataURI)},
-        }, nil
+lookupTool := genkit.DefineTool(g, "cityPopulation",
+    "Returns the population of a city.",
+    func(ctx *ai.ToolContext, input CityInput) (int, error) {
+        pop, err := db.Population(ctx, input.City)
+        if errors.Is(err, ErrNoSuchCity) {
+            return 0, tool.Fail(ctx, err) // the model tries another spelling
+        }
+        return pop, err // a lost connection stops the loop
+    },
+)
+```
+
+To return every error of a tool you do not own, such as an MCP tool, use the [`SoftToolErrors`](plugins/middleware/soft_tool_errors.go) middleware.
+
+The `ai/tool` package adds to a tool without changing its signature. `tool.AttachParts` adds parts that are not values, such as an image or a document, to the tool's response; they reach the client, and the model as far as its provider accepts them in a tool response. `tool.SendChunk` streams an `ai.ModelResponseChunk` the tool builds itself, such as progress, to the client while the tool runs (a no-op when the caller isn't streaming; the return value is always authoritative). `*ai.ToolContext` embeds the context they take:
+
+```go
+import "github.com/firebase/genkit/go/ai/tool"
+
+analyzeTool := genkit.DefineTool(g, "analyzeStock",
+    "Analyzes a stock and returns a summary with a chart.",
+    func(ctx *ai.ToolContext, input AnalyzeInput) (string, error) {
+        tool.SendChunk(ctx, &ai.ModelResponseChunk{
+            Role:    ai.RoleTool,
+            Content: []*ai.Part{ai.NewTextPart("fetching prices")},
+        })
+
+        tool.AttachParts(ctx, ai.NewMediaPart("image/png", chartDataURI))
+        return fmt.Sprintf("%s closed up 4%% this week.", input.Symbol), nil
     },
 )
 ```
@@ -938,7 +958,7 @@ response, _ := genkit.Generate(ctx, g,
 The `middleware` plugin also ships with:
 
 - [`ToolApproval`](plugins/middleware/tool_approval.go) — interrupts any tool not on an allow list and resumes once the call is explicitly approved on restart.
-- [`SoftToolErrors`](plugins/middleware/soft_tool_errors.go) — returns tool errors, and calls to tools that do not exist, to the model as the tool's response so it can correct itself, instead of failing the generation. A tool can do the same for a single error by returning `tool.Fail(ctx, err)` (`ai/exp/tool`).
+- [`SoftToolErrors`](plugins/middleware/soft_tool_errors.go) — returns tool errors, and calls to tools that do not exist, to the model as the tool's response so it can correct itself, instead of failing the generation. A tool can do the same for a single error by returning `tool.Fail(ctx, err)` (`ai/tool`).
 - [`Filesystem`](samples/basic-middleware/filesystem) — gives the model `list_files` and `read_file` tools (plus `write_file` and `edit_file` when `AllowWriteAccess` is set), all confined to a single `RootDir` via `os.Root` (Go 1.25+) so paths cannot escape via `..`, absolute paths, or symlinks.
 - [`Skills`](samples/basic-middleware/skills) — exposes a library of `SKILL.md` files following the [Agent Skills](https://agentskills.io) specification, so a skill written for any compliant agent works here. Scans `.agents/skills` and `skills` by default, on disk or inside `SkillFS`, so skills can ship in the binary through `//go:embed`. The model sees each skill's name and description, loads one on demand through `use_skill`, and reads the files a skill bundles through `read_skill_file` when `AllowResourceAccess` is set. `Preload` injects a skill up front when the application, rather than the model, decides it applies.
 
