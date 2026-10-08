@@ -24,6 +24,7 @@ import os from 'os';
 import path from 'path';
 import type { GenkitToolsError } from '../manager';
 import type { BaseRuntimeManager } from '../manager/manager';
+import { isLoopbackHost } from '../manager/reflection-auth';
 import { detectRuntimeSync, logger, writeToolsInfoFile } from '../utils';
 import {
   createToolsRequestEvent,
@@ -42,16 +43,6 @@ const MAX_PAYLOAD_SIZE = 30000000;
  * passing an explicit host.
  */
 const DEFAULT_HOST = '127.0.0.1';
-
-/** True when `host` is a loopback address, i.e. only reachable locally. */
-function isLoopbackHost(host: string): boolean {
-  return (
-    host === '127.0.0.1' ||
-    host === 'localhost' ||
-    host === '::1' ||
-    host === '[::1]'
-  );
-}
 
 const UI_ASSETS_GCS_BUCKET = `https://storage.googleapis.com/genkit-assets`;
 const UI_ASSETS_ZIP_FILE_NAME = `${toolsPackage.version}.zip`;
